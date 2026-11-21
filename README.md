@@ -77,7 +77,7 @@ npm run test:e2e:cross-browser # Firefox + WebKit (requires Playwright browsers)
 npm run test:all
 ```
 
-The default Playwright smoke test uses a pinned compressed headless Chromium from the npm registry, so it does not need a separate browser download. CI runs Firefox and WebKit in Playwright's version-matched browser container, also avoiding runtime CDN downloads. Coverage includes desktop/mobile layouts, a mocked standard gamepad, save import/restore/delete, repeated mGBA boot/teardown, archive identity, storage-quota failures, backup checksums, and service assets. The end-to-end fixture is a tiny project-generated GBA program that loops forever and contains no commercial game data.
+The default Playwright smoke test uses a pinned compressed headless Chromium from the npm registry, so it does not need a separate browser download. CI runs Firefox and WebKit in Playwright's version-matched browser container, also avoiding runtime CDN downloads. Firefox receives the real mGBA smoke test; Linux headless WebKit validates deployment and responsive UI but skips the core boot because that container has no compatible mGBA WebGL context. Coverage includes desktop/mobile layouts, a mocked standard gamepad, save import/restore/delete, repeated mGBA boot/teardown, archive identity, storage-quota failures, backup checksums, and service assets. The end-to-end fixture is a tiny project-generated GBA program that loops forever and contains no commercial game data.
 
 Dependabot proposes monthly grouped updates for browser/DOM testing packages and GitHub Actions. EmulatorJS runtime upgrades remain manual because its loader, runtime, core, provenance, and patched hashes must move together.
 
