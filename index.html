@@ -5,6 +5,12 @@
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>PixelGBA — Game Boy Advance Emulator</title>
 <meta name="description" content="A Game Boy Advance emulator for your PC. Play .gba ROMs, save anytime, and use built-in Pokémon cheat codes. Runs fully offline." />
+<meta name="theme-color" content="#7c6cff" />
+<meta name="application-name" content="PixelGBA" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<link rel="manifest" href="manifest.webmanifest" />
+<link rel="apple-touch-icon" href="assets/apple-touch-icon.png" />
 <link rel="stylesheet" href="styles.css" />
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect x='6' y='10' width='52' height='44' rx='10' fill='%237c6cff'/%3E%3Crect x='14' y='18' width='36' height='24' rx='4' fill='%230b1020'/%3E%3Ccircle cx='24' cy='47' r='3' fill='%23a3e635'/%3E%3Ccircle cx='40' cy='47' r='3' fill='%23f472b6'/%3E%3C/svg%3E" />
 </head>
@@ -344,6 +350,33 @@ B505DB41 6E39EA4E</pre><p class="tiny muted">8 + 4 hex digits (some CB codes are
       </div>
 
       <div class="panel">
+        <div class="panel-head"><h2>Install &amp; storage health</h2><span class="badge" id="storagePersistBadge">checking…</span></div>
+        <p class="muted small">Install PixelGBA for a standalone app window and ask the browser to protect this site's local games and saves from routine eviction.</p>
+        <div class="storage-meter" aria-label="Browser storage usage">
+          <div><span id="storageUsed">Checking storage…</span><span id="storageQuota"></span></div>
+          <progress id="storageProgress" max="100" value="0"></progress>
+        </div>
+        <p class="tiny muted" id="storageAdvice" aria-live="polite"></p>
+        <p class="tiny storage-warning" id="backupReminder" hidden></p>
+        <div class="mini-actions">
+          <button type="button" class="btn btn-primary btn-sm" id="btnInstallApp" hidden>Install PixelGBA</button>
+          <button type="button" class="btn btn-ghost btn-sm" id="btnPersistStorage">Protect local data</button>
+          <button type="button" class="btn btn-ghost btn-sm" id="btnRefreshStorage">Refresh usage</button>
+        </div>
+        <p class="tiny muted" id="installHint">On iPhone or iPad, use Share → Add to Home Screen.</p>
+      </div>
+
+      <div class="panel">
+        <h2>Compatibility &amp; diagnostics</h2>
+        <p class="muted small">The report contains app/runtime versions, broad browser capabilities, storage totals, service-worker state, and recent allowlisted error categories. It never includes ROMs, saves, cheats, filenames, URLs, free-form error text, or hardware identifiers.</p>
+        <div class="capability-grid" id="capabilityGrid" aria-live="polite"></div>
+        <div class="mini-actions">
+          <button type="button" class="btn btn-ghost btn-sm" id="btnExportDiagnostics">Export diagnostic report</button>
+          <a class="btn btn-ghost btn-sm" href="docs/DEVICE_TEST_MATRIX.md">Device test checklist</a>
+        </div>
+      </div>
+
+      <div class="panel">
         <h2>About &amp; legal</h2>
         <p class="muted small">PixelGBA is a GPL-3.0 front-end built on <b>EmulatorJS 4.2.3</b> (GPL-3.0) driving the <b>mGBA</b> core (MPL-2.0). The engine and core are bundled locally, so gameplay works offline after download. No ROMs or BIOS files are included or downloaded.</p>
         <p class="muted small">Only play ROMs of games you legally own. Pokémon © Nintendo / Creatures Inc. / GAME FREAK inc. This app is not affiliated with Nintendo. See <a href="LICENSE" style="color:#cfc8ff">LICENSE</a> and <a href="THIRD_PARTY_NOTICES.md" style="color:#cfc8ff">third-party notices</a> for source and license details.</p>
@@ -358,6 +391,11 @@ B505DB41 6E39EA4E</pre><p class="tiny muted">8 + 4 hex digits (some CB codes are
   </section>
 </main>
 
+<div class="operation-banner" id="operationBanner" hidden role="status" aria-live="polite">
+  <span id="operationLabel">Working…</span>
+  <progress id="operationProgress" max="100"></progress>
+  <button type="button" class="btn btn-ghost btn-sm" id="btnCancelOperation">Cancel</button>
+</div>
 <div class="update-banner" id="updateBanner" hidden role="status">
   <span>A new PixelGBA version is ready. Your local games and saves will be kept.</span>
   <button type="button" class="btn btn-primary btn-sm" id="btnApplyUpdate">Update and reload</button>
@@ -372,24 +410,7 @@ B505DB41 6E39EA4E</pre><p class="tiny muted">8 + 4 hex digits (some CB codes are
 </div>
 <div class="toasts" id="toasts" aria-live="polite"></div>
 
-<script>
-/* FLAT-BUILD path map: every engine file sits next to index.html, so tell EmulatorJS
-   where each relative path really lives. Used by app.js when it configures the engine. */
-window.PIXELGBA_FLAT_PATHS = {
-  "loader.js":               "loader.js",
-  "emulator.min.js":         "emulator.min.js",
-  "emulator.min.css":        "emulator.min.css",
-  "version.json":            "version.json",
-  "en-US.json":              "en-US.json",
-  "mgba.json":               "mgba.json",
-  "mgba-wasm.data":          "mgba-wasm.data",
-  "mgba-legacy-wasm.data":   "mgba-legacy-wasm.data",
-  "extract7z.js":            "extract7z.js",
-  "extractzip.js":           "extractzip.js",
-  "libunrar.js":             "libunrar.js",
-  "libunrar.wasm":           "libunrar.wasm"
-};
-</script>
+<script src="config.js"></script>
 <!-- Engine + data + app -->
 <script src="build-info.js"></script>
 <script src="cheats-db.js"></script>

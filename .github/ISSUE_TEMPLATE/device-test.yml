@@ -1,0 +1,53 @@
+name: Device compatibility report
+description: Record a physical-device pass or a compatibility failure without sharing game data.
+title: "[Device test]: "
+labels: [compatibility]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Follow `docs/DEVICE_TEST_MATRIX.md`. Never attach ROMs, battery saves, save states, cheats, or screenshots containing personal information.
+  - type: input
+    id: build
+    attributes:
+      label: PixelGBA build ID
+      description: Find this in the exported diagnostic report.
+    validations:
+      required: true
+  - type: input
+    id: device
+    attributes:
+      label: Physical device and OS version
+      placeholder: iPhone model, current iOS version
+    validations:
+      required: true
+  - type: input
+    id: browser
+    attributes:
+      label: Browser and version
+      placeholder: Safari 19.1, installed standalone
+    validations:
+      required: true
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks completed
+      options:
+        - label: Deployment self-check passed
+        - label: Raw and archived ROM identity tested
+        - label: Background-page save flush survived sleep/wake and stop/relaunch
+        - label: Touch, rotation, fullscreen, and audio tested where applicable
+        - label: Physical controller reconnect tested where applicable
+        - label: Full backup restored in a clean browser profile
+  - type: textarea
+    id: result
+    attributes:
+      label: Result and reproduction steps
+      description: Include expected/actual behavior. Do not include game filenames.
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Sanitized diagnostic report
+      description: Optional. Paste or attach only the report exported by PixelGBA.

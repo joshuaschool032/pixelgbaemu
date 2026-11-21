@@ -19,6 +19,8 @@ const types = {
   ".mjs": "text/javascript; charset=utf-8",
   ".css": "text/css; charset=utf-8",
   ".json": "application/json; charset=utf-8",
+  ".webmanifest": "application/manifest+json; charset=utf-8",
+  ".png": "image/png",
   ".wasm": "application/wasm",
   ".data": "application/octet-stream",
   ".txt": "text/plain; charset=utf-8",
@@ -48,13 +50,21 @@ const server = http.createServer((request, response) => {
       response.end("Not found");
       return;
     }
-    response.writeHead(200, {
+    const headers = {
       "Content-Type": types[path.extname(filename).toLowerCase()] || "application/octet-stream",
       "Content-Length": stat.size,
       "Cache-Control": "no-cache",
       "X-Content-Type-Options": "nosniff",
+      "Referrer-Policy": "no-referrer",
       "Cross-Origin-Resource-Policy": "same-origin",
-    });
+      "Permissions-Policy": "accelerometer=(), camera=(), geolocation=(), microphone=(), payment=(), usb=(), gamepad=(self), fullscreen=(self), screen-wake-lock=(self)",
+      "Content-Security-Policy": "default-src 'self'; base-uri 'self'; object-src 'none'; form-action 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval' 'wasm-unsafe-eval' blob:; worker-src 'self' blob:; connect-src 'self' blob:; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; media-src 'self' blob:",
+    };
+    if (process.env.PIXELGBA_CROSS_ORIGIN_ISOLATED === "1") {
+      headers["Cross-Origin-Opener-Policy"] = "same-origin";
+      headers["Cross-Origin-Embedder-Policy"] = "require-corp";
+    }
+    response.writeHead(200, headers);
     if (request.method === "HEAD") response.end();
     else fs.createReadStream(filename).pipe(response);
   });

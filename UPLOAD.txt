@@ -9,7 +9,11 @@ REQUIRED RUNTIME FILES
   index.html              app shell
   styles.css              app styles
   app.js                  app logic
-  cheats-db.js            cheat presets
+  config.js               flat runtime path map
+  pixelgba-worker.js      cancellable ROM/backup worker
+  manifest.webmanifest    installable-app metadata
+  assets/                 generated 180/192/512 px app icons
+  cheats-db.js            revision-scoped cheat presets and provenance
   loader.js               patched EmulatorJS loader
   emulator.min.js         EmulatorJS runtime
   emulator.min.css        EmulatorJS styles
@@ -27,15 +31,17 @@ REQUIRED RUNTIME FILES
   check.html               deployment self-check
   LICENSE                 project/EmulatorJS GPL-3.0 text
   THIRD_PARTY_NOTICES.md  component notices and source links
+  SECURITY.md             deployment header guidance
+  docs/                   device matrix and cheat provenance
   LICENSES/               additional license texts
 
 GITHUB PAGES
-  1. Push the complete repository to GitHub.
-  2. Settings -> Pages -> Deploy from a branch.
-  3. Select the default branch and / (root), then Save.
-  4. Open https://<username>.github.io/<repository>/check.html.
-  5. Continue only when every runtime file passes.
-  6. Open the main Pages URL and choose a legally obtained .gba ROM.
+  1. In Settings -> Pages, select GitHub Actions as the source.
+  2. Merge to main or run the Deploy GitHub Pages workflow manually.
+  3. The workflow tests, assembles, and deploys the exact .pages artifact.
+  4. Its verify job checks every deployed asset and content-derived build ID.
+  5. Open https://<username>.github.io/<repository>/check.html.
+  6. Continue only when every runtime file passes.
 
 LOCAL USE
   Windows: double-click serve.bat
@@ -47,8 +53,10 @@ The local launchers bind only to the loopback interface.
 
 DEVELOPER VERIFICATION
   npm ci
+  npm run build:icons  (required after changing the icon generator)
   npm run build:meta   (required after changing any cached runtime asset)
   npm run test:all
+  npm run build:pages
 
 See README.md for storage behavior, browser support, dependency updates,
 troubleshooting, tests, and licensing details.

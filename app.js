@@ -17,7 +17,8 @@
     if (!n && n !== 0) return "—";
     if (n < 1024) return n + " B";
     if (n < 1048576) return (n / 1024).toFixed(1) + " KB";
-    return (n / 1048576).toFixed(2) + " MB";
+    if (n < 1073741824) return (n / 1048576).toFixed(2) + " MB";
+    return (n / 1073741824).toFixed(2) + " GB";
   };
   const fmtWhen = (t) => {
     if (!t) return "—";
@@ -65,6 +66,84 @@
   };
   const textDecoder = new TextDecoder();
   const textEncoder = new TextEncoder();
+  let activeOperation = null;
+
+  function beginOperation(label, { cancelable = true } = {}) {
+    if (activeOperation) activeOperation.abort();
+    const controller = new AbortController();
+    activeOperation = controller;
+    $("#operationLabel").textContent = label;
+    $("#operationProgress").removeAttribute("value");
+    $("#btnCancelOperation").hidden = !cancelable;
+    $("#operationBanner").hidden = false;
+    return controller;
+  }
+  function updateOperation(value, label = null) {
+    const doc = window.document;
+    if (!doc) return;
+    const labelElement = doc.querySelector("#operationLabel");
+    const progress = doc.querySelector("#operationProgress");
+    if (!progress) return;
+    if (label && labelElement) labelElement.textContent = label;
+    if (Number.isFinite(value)) progress.value = Math.max(0, Math.min(100, value));
+    else progress.removeAttribute("value");
+  }
+  function finishOperation(controller) {
+    if (controller && activeOperation !== controller) return;
+    const banner = window.document && window.document.querySelector("#operationBanner");
+    if (banner) banner.hidden = true;
+    activeOperation = null;
+  }
+  $("#btnCancelOperation").addEventListener("click", () => activeOperation && activeOperation.abort());
+
+  function runDataWorker(type, payload, { signal, onProgress, transfers = [] } = {}) {
+    if (typeof Worker === "undefined") return Promise.reject(new Error("Workers unavailable"));
+    return new Promise((resolve, reject) => {
+      const worker = new Worker(new URL("pixelgba-worker.js", location.href));
+      const id = Math.random().toString(36).slice(2);
+      const cleanup = () => { worker.terminate(); signal?.removeEventListener("abort", abort); };
+      const abort = () => { cleanup(); reject(new DOMException("Operation cancelled", "AbortError")); };
+      if (signal?.aborted) { abort(); return; }
+      signal?.addEventListener("abort", abort, { once: true });
+      worker.onerror = (event) => { cleanup(); reject(new Error(event.message || "Background worker failed")); };
+      worker.onmessage = (event) => {
+        if (!event.data || event.data.id !== id) return;
+        if ("progress" in event.data) { onProgress?.(event.data.progress, event.data.label); return; }
+        cleanup();
+        if (event.data.error) reject(new Error(event.data.error));
+        else resolve(event.data.result);
+      };
+      worker.postMessage({ id, type, payload }, transfers);
+    });
+  }
+
+  async function readFileWithProgress(file, signal, onProgress) {
+    if (!file.stream || !file.size) {
+      const buffer = await file.arrayBuffer();
+      if (signal?.aborted) throw new DOMException("Operation cancelled", "AbortError");
+      return buffer;
+    }
+    const reader = file.stream().getReader();
+    const chunks = []; let total = 0;
+    const abort = () => reader.cancel().catch(() => {});
+    if (signal?.aborted) throw new DOMException("Operation cancelled", "AbortError");
+    signal?.addEventListener("abort", abort, { once: true });
+    try {
+      for (;;) {
+        if (signal?.aborted) throw new DOMException("Operation cancelled", "AbortError");
+        const { done, value } = await reader.read();
+        if (done) break;
+        chunks.push(value); total += value.byteLength;
+        onProgress?.(Math.min(20, total / file.size * 20), "Reading " + file.name + "…");
+      }
+    } finally {
+      signal?.removeEventListener("abort", abort);
+    }
+    if (signal?.aborted) throw new DOMException("Operation cancelled", "AbortError");
+    const output = new Uint8Array(total); let offset = 0;
+    for (const chunk of chunks) { output.set(chunk, offset); offset += chunk.byteLength; }
+    return output.buffer;
+  }
 
   async function digestHex(value) {
     const bytes = asBytes(value);
@@ -115,7 +194,7 @@
     return runtimeBundlePromise;
   }
 
-  async function extractWithBundledRuntime(bytes) {
+  async function extractWithBundledRuntime(bytes, onProgress = null, signal = null) {
     await ensureRuntimeBundle();
     const bridge = {
       downloadFile: async (path, _progress, _cors, options = {}) => {
@@ -127,7 +206,11 @@
       },
       startGameError(message) { throw new Error(message || "Archive extraction failed"); },
     };
-    return new window.EJS_COMPRESSION(bridge).decompress(bytes, () => {});
+    return new window.EJS_COMPRESSION(bridge).decompress(bytes, (suffix) => {
+      if (signal?.aborted) throw new DOMException("Operation cancelled", "AbortError");
+      const percent = Number.parseInt(String(suffix).replace(/\D/g, ""), 10);
+      onProgress?.(Number.isFinite(percent) ? 30 + percent * 0.35 : null, "Extracting ROM…");
+    });
   }
 
   async function extractZip(bytes) {
@@ -175,7 +258,7 @@
     return { name: entry.name, data };
   }
 
-  async function extractArchiveRom(rawBytes, filename) {
+  async function extractArchiveRom(rawBytes, filename, onProgress = null, signal = null) {
     const isZip = rawBytes[0] === 0x50 && rawBytes[1] === 0x4b;
     if (isZip) {
       try { return await extractZip(rawBytes); } catch (error) {
@@ -183,7 +266,7 @@
       }
     }
     if (!isZip && !/\.(7z|rar)$/i.test(filename)) return { name: filename, data: rawBytes };
-    const files = await extractWithBundledRuntime(rawBytes);
+    const files = await extractWithBundledRuntime(rawBytes, onProgress, signal);
     const candidates = Object.entries(files || {})
       .filter(([name, data]) => /\.(gba|agb|bin|rom)$/i.test(name) && data && asBytes(data).length)
       .map(([name, data]) => ({ name, data: asBytes(data) }))
@@ -193,15 +276,44 @@
   }
 
   /** Hash the extracted cartridge so raw, ZIP, 7z and RAR copies share one identity. */
-  async function identifyRom(file) {
-    const rawBuffer = await file.arrayBuffer();
-    const rawBytes = new Uint8Array(rawBuffer);
-    const extracted = await extractArchiveRom(rawBytes, file.name);
-    const romBytes = asBytes(extracted.data);
-    const gid = await contentId(romBytes);
-    const rawGid = romBytes === rawBytes ? gid : await contentId(rawBytes);
-    const romName = String(extracted.name || file.name).split(/[\\/]/).pop() || "game.gba";
+  async function identifyRom(file, { signal = null, onProgress = null } = {}) {
+    let rawBuffer = await readFileWithProgress(file, signal, onProgress);
+    let prepared = null;
+    if (typeof Worker !== "undefined") {
+      try {
+        prepared = await runDataWorker("prepareRom", { buffer: rawBuffer, filename: file.name }, {
+          signal,
+          onProgress,
+        });
+        rawBuffer = prepared.buffer;
+      } catch (error) {
+        if (error.name === "AbortError") throw error;
+        // Older browsers may not support the dedicated worker. Continue on the
+        // main thread rather than making ROM loading unavailable.
+        console.warn("ROM worker unavailable; falling back to the main thread", error);
+      }
+    }
+
+    let romBytes, gid, rawGid, extractedName;
+    if (prepared && !prepared.fallback) {
+      romBytes = new Uint8Array(prepared.buffer);
+      gid = prepared.gid;
+      rawGid = prepared.rawGid;
+      extractedName = prepared.name;
+    } else {
+      const rawBytes = new Uint8Array(rawBuffer);
+      onProgress?.(30, "Inspecting archive…");
+      const extracted = await extractArchiveRom(rawBytes, file.name, onProgress, signal);
+      if (signal?.aborted) throw new DOMException("Operation cancelled", "AbortError");
+      romBytes = asBytes(extracted.data);
+      onProgress?.(70, "Identifying cartridge…");
+      gid = await contentId(romBytes);
+      rawGid = romBytes === rawBytes ? gid : await contentId(rawBytes);
+      extractedName = extracted.name;
+    }
+    const romName = String(extractedName || file.name).split(/[\\/]/).pop() || "game.gba";
     const legacyGids = [...new Set([legacyGidOf(file.name), legacyGidOf(romName), rawGid])].filter((id) => id && id !== gid);
+    onProgress?.(100, "ROM ready");
     return {
       gid,
       legacyGid: legacyGids[0] || null,
@@ -210,9 +322,10 @@
       name: romName,
       sourceName: file.name,
       header: parseGbaHeader(romBytes),
-      archived: rawBytes.length !== romBytes.length || romName !== file.name,
+      archived: romName !== file.name || rawGid !== gid,
     };
   }
+
 
   /* EmulatorJS asks for a screen wake lock; embedded/preview contexts deny it.
      Swallow the rejection so it doesn't surface as an unhandled error. */
@@ -364,6 +477,7 @@
   const K_LASTPRESET = "pgba.lastPreset";
   const K_LASTROM = "pgba.lastRom";
   const K_LIBRARY_SORT = "pgba.librarySort";
+  const K_LAST_BACKUP = "pgba.lastBackup";
   const STATE_MAGIC = "PIXELGBA_STATE_V1\n";
   const BACKUP_FORMAT = "pixelgba-backup-v1";
   const CORE_ID = "mgba";
@@ -391,6 +505,8 @@
     favoritesOnly: false,
     saveSyncQueue: Promise.resolve(),
     saveEventHandler: null,
+    diagnostics: [],
+    installPrompt: null,
   };
 
   if (!Array.isArray(S.roms)) S.roms = [];
@@ -429,6 +545,7 @@
     if (focus) tab.focus();
     if (tab.dataset.view === "saves") renderSaves();
     if (tab.dataset.view === "cheats") renderCheats();
+    if (tab.dataset.view === "help") refreshStorageHealth();
   }
   tabs.forEach((tab, index) => {
     tab.addEventListener("click", () => activateTab(tab));
@@ -783,16 +900,27 @@
 
     S.starting = true;
     const launchId = ++S.launchId;
+    const operation = beginOperation("Reading " + file.name + "…");
     let identity;
     try {
       pill("Reading game…", true);
-      identity = await identifyRom(file);
+      identity = await identifyRom(file, {
+        signal: operation.signal,
+        onProgress: (value, label) => updateOperation(value, label),
+      });
       if (launchId !== S.launchId) return;
     } catch (error) {
       S.starting = false;
-      pill("Could not read game", false);
-      toast("Could not read that ROM file", "error");
+      if (error.name === "AbortError") {
+        pill("Engine ready · offline", false);
+        toast("ROM loading cancelled", "info");
+      } else {
+        pill("Could not read game", false);
+        toast(error.message || "Could not read that ROM file", "error");
+      }
       return;
+    } finally {
+      finishOperation(operation);
     }
 
     await stopGame({ silent: true, keepOverlay: true, preserveLaunch: true });
@@ -1508,12 +1636,13 @@
     const list = getCheatList();
     let item = list.find((c) => normalizeCode(c.code) === norm);
     if (!item) {
-      item = { desc, code: norm, checked: !!on, custom: !!meta.custom, tag: meta.tag || "", type: meta.type || "" };
+      item = { desc, code: norm, checked: !!on, custom: !!meta.custom, tag: meta.tag || "", type: meta.type || "", provenance: meta.provenance || "" };
       list.push(item);
     } else {
       item.checked = !!on;
       if (meta.tag) item.tag = meta.tag;
       if (meta.type) item.type = meta.type;
+      if (meta.provenance) item.provenance = meta.provenance;
     }
     setCheatList(list);
     if (S.running) engineAddCheat(item.desc, item.code, item.checked);
@@ -1565,7 +1694,19 @@
     const mismatchNote = S.current && S.current.header && !matched
       ? "No preset exactly matches cartridge " + S.current.header.gameCode + " revision " + S.current.header.revision + ". Presets below are manual and may be incompatible. "
       : "";
-    $("#presetNote").textContent = mismatchNote + (game.note || "");
+    const provenanceOk = game.provenance?.status === "cross-referenced";
+    const cartridgeTargets = (game.headers || []).map((header) => header.gameCode + " revision " + (header.revisions || []).join("/")).join(", ");
+    const note = $("#presetNote");
+    note.textContent = mismatchNote + (provenanceOk ? "Only entries confirmed in the pinned revision-specific source can be toggled. " : "This legacy preset is disabled until a revision-specific source is independently cross-referenced. ") + (game.note || "") +
+      " Target: " + (game.region || "unknown region") + " " + (game.revisionLabel || "unknown revision") + (cartridgeTargets ? " (" + cartridgeTargets + ")" : "") + ". ";
+    if (game.provenance?.url) {
+      const source = document.createElement("a");
+      source.href = game.provenance.url;
+      source.target = "_blank";
+      source.rel = "noopener noreferrer";
+      source.textContent = "View pinned provenance source";
+      note.appendChild(source);
+    }
 
     const plist = $("#presetList");
     plist.innerHTML = "";
@@ -1573,16 +1714,19 @@
       const row = document.createElement("div");
       row.className = "preset-cheat";
       const on = cheatIsOn(c.code);
+      const usablePreset = provenanceOk && c.verified === true;
       row.innerHTML =
-        '<label class="switch"><input type="checkbox" ' + (on ? "checked" : "") + ' /><span></span></label>' +
+        '<label class="switch"><input type="checkbox" ' + (on ? "checked" : "") + (usablePreset ? "" : " disabled") + ' /><span></span></label>' +
         '<div class="pc-body"><div class="pc-name">' + esc(c.name) +
-        (c.tag ? ' <span class="tag">' + esc(c.tag) + "</span>" : "") + "</div>" +
+        (c.tag ? ' <span class="tag">' + esc(c.tag) + "</span>" : "") +
+        (c.type ? ' <span class="tag">' + esc(c.type === "gs" ? "GameShark/AR" : c.type === "cb" ? "CodeBreaker" : "mixed") + "</span>" : "") +
+        (!usablePreset ? ' <span class="tag tag-warn">source needed</span>' : "") + "</div>" +
         '<div class="pc-code">' + esc(normalizeCode(c.code)) + "</div>" +
         (c.note ? '<div class="pc-note">' + esc(c.note) + "</div>" : "") +
         "</div>";
       const cb = $("input", row);
       cb.addEventListener("change", () => {
-        toggleCheat(c.name, c.code, cb.checked, { tag: c.tag });
+        toggleCheat(c.name, c.code, cb.checked, { tag: c.tag, type: c.type, provenance: game.provenance?.url || "" });
       });
       plist.appendChild(row);
     }
@@ -1602,11 +1746,12 @@
           '<label class="switch"><input type="checkbox" ' + (c.checked ? "checked" : "") + (S.running ? "" : " disabled") + ' /><span></span></label>' +
           '<div class="ac-body"><div class="ac-name">' + esc(c.desc) +
           (c.custom ? ' <span class="tag">custom</span>' : "") +
-          (c.tag ? ' <span class="tag">' + esc(c.tag) + "</span>" : "") + "</div>" +
+          (c.tag ? ' <span class="tag">' + esc(c.tag) + "</span>" : "") +
+          (c.type ? ' <span class="tag">' + esc(c.type) + "</span>" : "") + "</div>" +
           '<div class="ac-code">' + esc(normalizeCode(c.code)) + "</div></div>" +
-          '<button class="ac-del" title="Remove">×</button>';
+          '<button type="button" class="ac-del" title="Remove">×</button>';
         $("input", row).addEventListener("change", (e) => {
-          toggleCheat(c.desc, c.code, e.target.checked, { custom: c.custom, tag: c.tag });
+          toggleCheat(c.desc, c.code, e.target.checked, { custom: c.custom, tag: c.tag, type: c.type, provenance: c.provenance });
         });
         $(".ac-del", row).addEventListener("click", () => removeCheat(c.code));
         al.appendChild(row);
@@ -1855,16 +2000,37 @@
     return value;
   }
 
-  async function createBackupDocument() {
+  async function transformBackupEntries(entries, type, { signal = null, onProgress = null } = {}) {
+    if (typeof Worker !== "undefined") {
+      try { return await runDataWorker(type, { entries }, { signal, onProgress }); }
+      catch (error) {
+        if (error.name === "AbortError") throw error;
+        console.warn("Backup worker unavailable; falling back to the main thread", error);
+      }
+    }
+    const transform = type === "encodeEntries" ? encodeBackupValue : decodeBackupValue;
+    const output = [];
+    for (let index = 0; index < entries.length; index++) {
+      if (signal?.aborted) throw new DOMException("Operation cancelled", "AbortError");
+      output.push([entries[index][0], await transform(entries[index][1])]);
+      onProgress?.((index + 1) / Math.max(1, entries.length) * 100, type === "encodeEntries" ? "Encoding backup…" : "Verifying backup…");
+    }
+    return output;
+  }
+
+  async function createBackupDocument({ signal = null, onProgress = null } = {}) {
     if (S.running) await syncSaveNow({ force: true }).catch(() => {});
     const local = store.allKeys()
       .filter((key) => key.startsWith("pgba.") || key.startsWith("ejs-pgba-") || key === "ejs-settings")
       .map((key) => [key, store.raw(key)]);
-    const saves = [];
-    for (const [key, value] of await IDB.entries("saves").catch(() => [])) saves.push([String(key), await encodeBackupValue(value)]);
-    const states = [];
-    for (const [key, value] of await IDB.entries("states").catch(() => [])) states.push([String(key), await encodeBackupValue(value)]);
-    const payload = { schema: 1, appVersion: "1.2.0", local, saves, states };
+    const rawEntries = [
+      ...(await IDB.entries("saves").catch(() => [])).map(([key, value]) => ["s:" + String(key), value]),
+      ...(await IDB.entries("states").catch(() => [])).map(([key, value]) => ["t:" + String(key), value]),
+    ];
+    const encoded = await transformBackupEntries(rawEntries, "encodeEntries", { signal, onProgress });
+    const saves = encoded.filter(([key]) => key.startsWith("s:")).map(([key, value]) => [key.slice(2), value]);
+    const states = encoded.filter(([key]) => key.startsWith("t:")).map(([key, value]) => [key.slice(2), value]);
+    const payload = { schema: 1, appVersion: "1.3.0", local, saves, states };
     const payloadText = JSON.stringify(payload);
     return {
       format: BACKUP_FORMAT,
@@ -1874,7 +2040,7 @@
     };
   }
 
-  async function validateBackupDocument(documentValue) {
+  async function validateBackupDocument(documentValue, { signal = null, onProgress = null } = {}) {
     if (!documentValue || documentValue.format !== BACKUP_FORMAT || !documentValue.payload) throw new Error("This is not a PixelGBA backup");
     const payloadText = JSON.stringify(documentValue.payload);
     if (documentValue.payloadSha256 !== await digestHex(textEncoder.encode(payloadText))) throw new Error("The backup manifest checksum does not match");
@@ -1885,38 +2051,50 @@
       if (typeof key !== "string" || typeof raw !== "string" || !(key.startsWith("pgba.") || key.startsWith("ejs-pgba-") || key === "ejs-settings")) throw new Error("The backup contains an unsafe settings key");
       return [key, raw];
     });
-    const decodeEntries = async (entries) => {
-      const output = [];
-      for (const entry of entries) {
-        if (!Array.isArray(entry) || typeof entry[0] !== "string" || entry[0].length > 256) throw new Error("The backup contains an invalid database key");
-        output.push([entry[0], await decodeBackupValue(entry[1])]);
-      }
-      return output;
+    const entries = [
+      ...payload.saves.map((entry) => ["s:", entry]),
+      ...payload.states.map((entry) => ["t:", entry]),
+    ].map(([prefix, entry]) => {
+      if (!Array.isArray(entry) || typeof entry[0] !== "string" || entry[0].length > 256) throw new Error("The backup contains an invalid database key");
+      return [prefix + entry[0], entry[1]];
+    });
+    const decoded = await transformBackupEntries(entries, "decodeEntries", { signal, onProgress });
+    return {
+      local: safeLocal,
+      saves: decoded.filter(([key]) => key.startsWith("s:")).map(([key, value]) => [key.slice(2), value]),
+      states: decoded.filter(([key]) => key.startsWith("t:")).map(([key, value]) => [key.slice(2), value]),
     };
-    return { local: safeLocal, saves: await decodeEntries(payload.saves), states: await decodeEntries(payload.states) };
   }
 
   async function exportFullBackup() {
+    const operation = beginOperation("Preparing full backup…");
     try {
-      const backup = await createBackupDocument();
+      const backup = await createBackupDocument({ signal: operation.signal, onProgress: updateOperation });
+      updateOperation(100, "Backup ready");
       downloadBlob(new Blob([JSON.stringify(backup)], { type: "application/json" }), "pixelgba-backup-" + tsName() + ".pgbackup");
+      persist(K_LAST_BACKUP, Date.now(), "the backup reminder");
+      refreshStorageHealth();
       toast("Full backup exported with checksums", "success");
     } catch (error) {
-      console.warn("backup export failed", error);
-      toast("Could not export the full backup", "error", 6000);
-    }
+      if (error.name === "AbortError") toast("Backup export cancelled", "info");
+      else { console.warn("backup export failed", error); toast("Could not export the full backup", "error", 6000); }
+    } finally { finishOperation(operation); }
   }
 
   async function restoreFullBackup(file) {
     if (!file || file.size > 768 * 1024 * 1024) { toast("That backup is too large to restore safely", "error"); return; }
+    const verifyOperation = beginOperation("Reading backup…");
     let decoded;
     try {
-      decoded = await validateBackupDocument(JSON.parse(await file.text()));
+      updateOperation(5, "Reading backup…");
+      decoded = await validateBackupDocument(JSON.parse(await file.text()), { signal: verifyOperation.signal, onProgress: updateOperation });
     } catch (error) {
-      toast(error.message || "That backup is invalid", "error", 7000);
+      if (error.name === "AbortError") toast("Backup restore cancelled", "info");
+      else toast(error.message || "That backup is invalid", "error", 7000);
       return;
-    }
+    } finally { finishOperation(verifyOperation); }
     if (!confirm("Restore this verified PixelGBA backup? Current PixelGBA ROMs, saves, states, cheats and settings on this site will be replaced.")) return;
+    const restoreOperation = beginOperation("Restoring verified backup…", { cancelable: false });
     try {
       await stopGame({ silent: true });
       await deleteOwnedEngineFilesystem();
@@ -1928,14 +2106,15 @@
       for (const [key, raw] of decoded.local) {
         if (!store.setRaw(key, raw)) throw new Error("Browser settings storage is full");
       }
-      for (const [key, value] of decoded.saves) await IDB.put("saves", key, value);
-      for (const [key, value] of decoded.states) await IDB.put("states", key, value);
+      let done = 0; const total = decoded.saves.length + decoded.states.length;
+      for (const [key, value] of decoded.saves) { await IDB.put("saves", key, value); updateOperation(++done / Math.max(1, total) * 100, "Restoring backup…"); }
+      for (const [key, value] of decoded.states) { await IDB.put("states", key, value); updateOperation(++done / Math.max(1, total) * 100, "Restoring backup…"); }
       toast("Backup restored — reloading…", "success");
       setTimeout(() => location.reload(), 800);
     } catch (error) {
       console.warn("backup restore failed", error);
       toast("Restore stopped because browser storage rejected a record. Keep the backup file and free site storage before retrying.", "error", 9000);
-    }
+    } finally { finishOperation(restoreOperation); }
   }
 
   $("#btnExportBackup").addEventListener("click", exportFullBackup);
@@ -1945,6 +2124,158 @@
     event.target.value = "";
     if (file) restoreFullBackup(file);
   });
+
+
+  function diagnosticCategory(value) {
+    const text = String(value && typeof value === "object" ? [value.name, value.message, value.reason].filter(Boolean).join(" ") : value || "").toLowerCase();
+    if (/quota|storage full/.test(text)) return "storage-quota";
+    if (/indexeddb|database|transaction/.test(text)) return "storage-database";
+    if (/abort|cancel/.test(text)) return "cancelled-operation";
+    if (/network|fetch|offline|load failed/.test(text)) return "network-or-offline";
+    if (/worker/.test(text)) return "background-worker";
+    if (/webgl|graphics|context/.test(text)) return "graphics-context";
+    if (/wasm|webassembly/.test(text)) return "emulator-runtime";
+    if (/archive|zip|rar|7z|decompress/.test(text)) return "archive-processing";
+    if (/permission|security|denied|notallowed/.test(text)) return "browser-permission";
+    return "application-error";
+  }
+  function rememberDiagnosticError(value) {
+    S.diagnostics.push({ at: Date.now(), category: diagnosticCategory(value) });
+    S.diagnostics = S.diagnostics.slice(-10);
+  }
+  window.addEventListener("error", (event) => rememberDiagnosticError(event.error || event.message));
+  window.addEventListener("unhandledrejection", (event) => rememberDiagnosticError(event.reason));
+
+  async function getStorageHealth() {
+    let estimate = { usage: null, quota: null }, persisted = null;
+    try { if (navigator.storage?.estimate) estimate = await navigator.storage.estimate(); } catch (error) { rememberDiagnosticError(error); }
+    try { if (navigator.storage?.persisted) persisted = await navigator.storage.persisted(); } catch (error) { rememberDiagnosticError(error); }
+    return { usage: estimate.usage ?? null, quota: estimate.quota ?? null, persisted };
+  }
+
+  async function refreshStorageHealth() {
+    const elements = {
+      used: $("#storageUsed"), quota: $("#storageQuota"), progress: $("#storageProgress"),
+      badge: $("#storagePersistBadge"), persist: $("#btnPersistStorage"), advice: $("#storageAdvice"), reminder: $("#backupReminder"),
+    };
+    const health = await getStorageHealth();
+    if (!elements.used?.isConnected) return health;
+    const ratio = health.usage !== null && health.quota ? health.usage / health.quota : 0;
+    elements.used.textContent = health.usage === null ? "Storage estimate unavailable" : fmtBytes(health.usage) + " used";
+    elements.quota.textContent = health.quota === null ? "" : fmtBytes(Math.max(0, health.quota - (health.usage || 0))) + " available of " + fmtBytes(health.quota);
+    elements.progress.value = Math.round(ratio * 100);
+    elements.badge.textContent = health.persisted === true ? "protected" : health.persisted === false ? "evictable" : "unknown";
+    elements.persist.disabled = health.persisted === true || !navigator.storage?.persist;
+    const low = ratio >= .8 || (health.quota && health.usage !== null && health.quota - health.usage < 100 * 1024 * 1024);
+    elements.advice.textContent = low
+      ? "Storage is running low. Export a full backup and remove games or states you no longer need."
+      : health.persisted === true
+        ? "The browser reports this site's storage as persistent. Full backups are still recommended."
+        : "This data may be evicted under device pressure. Choose Protect local data and keep full backups.";
+    const lastBackup = store.get(K_LAST_BACKUP, 0);
+    const backupDue = S.roms.length > 0 && (!lastBackup || Date.now() - lastBackup > 30 * 86400000);
+    elements.reminder.hidden = !backupDue;
+    elements.reminder.textContent = lastBackup
+      ? "Your last recorded full backup was " + fmtWhen(lastBackup) + ". Export a fresh copy before major changes."
+      : "No full backup has been recorded on this device. Export one before relying on browser storage.";
+    return health;
+  }
+
+
+  $("#btnPersistStorage").addEventListener("click", async () => {
+    if (!navigator.storage?.persist) { toast("This browser does not expose persistent-storage requests", "warn"); return; }
+    let granted = false;
+    try { granted = await navigator.storage.persist(); } catch (error) { rememberDiagnosticError(error); }
+    toast(granted ? "Browser storage protection enabled" : "The browser did not grant persistent storage — keep regular backups", granted ? "success" : "warn", 6000);
+    refreshStorageHealth();
+  });
+  $("#btnRefreshStorage").addEventListener("click", refreshStorageHealth);
+
+  window.addEventListener("beforeinstallprompt", (event) => {
+    event.preventDefault();
+    S.installPrompt = event;
+    $("#btnInstallApp").hidden = false;
+    $("#installHint").textContent = "Install PixelGBA for a standalone app window; your local data remains in this browser profile.";
+  });
+  window.addEventListener("appinstalled", () => {
+    S.installPrompt = null;
+    $("#btnInstallApp").hidden = true;
+    $("#installHint").textContent = "PixelGBA is installed. Updates remain under your control through the in-app prompt.";
+    toast("PixelGBA installed", "success");
+  });
+  if ((window.matchMedia && window.matchMedia("(display-mode: standalone)").matches) || navigator.standalone === true) {
+    $("#installHint").textContent = "PixelGBA is running as an installed app.";
+  }
+  $("#btnInstallApp").addEventListener("click", async () => {
+    if (!S.installPrompt) { toast("Use your browser's Install app or Add to Home Screen command", "info", 5000); return; }
+    S.installPrompt.prompt();
+    const choice = await S.installPrompt.userChoice.catch(() => null);
+    S.installPrompt = null;
+    $("#btnInstallApp").hidden = true;
+    if (choice?.outcome !== "accepted") toast("Installation dismissed", "info");
+  });
+
+  function capabilitySnapshot() {
+    const canvas = document.createElement("canvas");
+    let webgl = false, webgl2 = false;
+    try {
+      if ("WebGLRenderingContext" in window) {
+        webgl2 = "WebGL2RenderingContext" in window && !!canvas.getContext("webgl2");
+        webgl = webgl2 || !!canvas.getContext("webgl");
+      }
+    } catch (error) {}
+    return {
+      WebAssembly: typeof WebAssembly !== "undefined",
+      IndexedDB: !!window.indexedDB,
+      WebGL: webgl,
+      WebGL2: webgl2,
+      "Service worker": "serviceWorker" in navigator,
+      "Background workers": typeof Worker !== "undefined",
+      "Archive streams": typeof DecompressionStream !== "undefined",
+      Gamepad: "getGamepads" in navigator,
+    };
+  }
+  function renderCapabilities() {
+    const grid = $("#capabilityGrid"); grid.innerHTML = "";
+    for (const [name, available] of Object.entries(capabilitySnapshot())) {
+      const chip = document.createElement("span");
+      chip.className = "capability " + (available ? "is-ok" : "is-bad");
+      chip.textContent = (available ? "✓ " : "× ") + name;
+      grid.appendChild(chip);
+    }
+  }
+  function browserFamily() {
+    const ua = navigator.userAgent || "";
+    if (/Firefox\//.test(ua)) return "Firefox";
+    if (/Edg\//.test(ua)) return "Edge (Chromium)";
+    if (/Chrom(?:e|ium)\//.test(ua)) return "Chromium";
+    if (/Safari\//.test(ua) && !/Chrom/.test(ua)) return "Safari/WebKit";
+    return "Unknown";
+  }
+  async function exportDiagnostics() {
+    const storageHealth = await getStorageHealth();
+    let workerState = "unsupported";
+    try {
+      const registration = await navigator.serviceWorker?.getRegistration();
+      workerState = registration ? (registration.active?.state || registration.waiting?.state || registration.installing?.state || "registered") : "not registered";
+    } catch (error) { rememberDiagnosticError(error); }
+    const report = {
+      format: "pixelgba-diagnostics-v1",
+      createdAt: new Date().toISOString(),
+      privacy: "Contains no ROMs, saves, cheats, filenames, page URLs, or hardware identifiers.",
+      app: { version: "1.3.0", build: window.PIXELGBA_BUILD?.id || "unknown", emulator: EMULATOR_VERSION, core: CORE_ID },
+      browser: { family: browserFamily(), secureContext: window.isSecureContext, standalone: !!(window.matchMedia && window.matchMedia("(display-mode: standalone)").matches), framed: IS_FRAMED },
+      capabilities: capabilitySnapshot(),
+      storage: storageHealth,
+      serviceWorker: workerState,
+      recentErrors: S.diagnostics.slice(),
+    };
+    downloadBlob(new Blob([JSON.stringify(report, null, 2)], { type: "application/json" }), "pixelgba-diagnostics-" + tsName() + ".json");
+    toast("Privacy-safe diagnostic report exported", "success");
+  }
+  $("#btnExportDiagnostics").addEventListener("click", exportDiagnostics);
+  renderCapabilities();
+  refreshStorageHealth();
 
   /* ========================================================================
      HELP → wipe everything
@@ -2056,7 +2387,9 @@
     nextFreeSlot,
     renderLibrary,
     deleteGameData,
+    refreshStorageHealth,
+    capabilitySnapshot,
     storage: IDB,
-    version: "1.2.0",
+    version: "1.3.0",
   };
 })();

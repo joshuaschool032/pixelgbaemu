@@ -193,6 +193,17 @@ test("raw and ZIP-wrapped copies share the extracted ROM identity", async (t) =>
   assert.ok(zipIdentity.legacyGids.some((gid) => gid !== zipIdentity.gid));
 });
 
+test("ROM preparation honors cancellation before expensive transforms", async (t) => {
+  const dom = createApp();
+  t.after(() => dom.window.close());
+  const controller = new dom.window.AbortController();
+  controller.abort();
+  await assert.rejects(
+    dom.window.PixelGBA.identifyRom({ name: "cancel.gba", size: 1024, stream: () => new Blob([makeHeaderRom()]).stream() }, { signal: controller.signal }),
+    (error) => error.name === "AbortError"
+  );
+});
+
 test("cheat presets use exact cartridge code and revision", (t) => {
   const dom = createApp();
   t.after(() => dom.window.close());
@@ -294,4 +305,60 @@ test("overlapping battery sync requests serialize and retain rolling copies", as
   assert.deepEqual([...new Uint8Array(record.data)], [2, 2, 3, 4]);
   assert.equal(record.history.length, 1);
   assert.deepEqual([...new Uint8Array(record.history[0].data)], [1, 2, 3, 4]);
+});
+
+test("storage health reports quota and can request persistence", async (t) => {
+  let persistCalls = 0;
+  const dom = createApp((window) => {
+    Object.defineProperty(window.navigator, "storage", { configurable: true, value: {
+      estimate: async () => ({ usage: 25 * 1024 * 1024, quota: 100 * 1024 * 1024 }),
+      persisted: async () => false,
+      persist: async () => { persistCalls++; return true; },
+    } });
+  });
+  t.after(() => dom.window.close());
+  await dom.window.PixelGBA.refreshStorageHealth();
+  assert.match(dom.window.document.querySelector("#storageUsed").textContent, /25\.00 MB used/);
+  assert.match(dom.window.document.querySelector("#storageQuota").textContent, /75\.00 MB available of 100\.00 MB/);
+  assert.equal(dom.window.document.querySelector("#storageProgress").value, 25);
+  dom.window.document.querySelector("#btnPersistStorage").click();
+  await wait(10);
+  assert.equal(persistCalls, 1);
+});
+
+test("PWA install prompt is exposed only after the browser offers it", async (t) => {
+  const dom = createApp();
+  t.after(() => dom.window.close());
+  const button = dom.window.document.querySelector("#btnInstallApp");
+  assert.equal(button.hidden, true);
+  let prompted = 0;
+  const event = new dom.window.Event("beforeinstallprompt", { cancelable: true });
+  event.prompt = () => { prompted++; };
+  event.userChoice = Promise.resolve({ outcome: "accepted" });
+  dom.window.dispatchEvent(event);
+  assert.equal(button.hidden, false);
+  button.click();
+  await wait(10);
+  assert.equal(prompted, 1);
+  assert.equal(button.hidden, true);
+});
+
+test("preset entries require per-code verification and pinned provenance", (t) => {
+  const dom = createApp();
+  t.after(() => dom.window.close());
+  const presetButtons = [...dom.window.document.querySelectorAll("#presetGames .preset-game")];
+  const games = dom.window.PIXELGBA_PRESETS.games;
+  assert.ok(games.every((game) => game.cheats.every((cheat) => typeof cheat.verified === "boolean")));
+
+  presetButtons.find((button) => button.textContent.includes("Sapphire")).click();
+  assert.ok([...dom.window.document.querySelectorAll("#presetList input")].every((input) => input.disabled));
+  assert.match(dom.window.document.querySelector("#presetNote").textContent, /disabled until/);
+
+  presetButtons.find((button) => button.textContent.includes("Emerald")).click();
+  assert.match(dom.window.document.querySelector("#presetNote a").href, /github\.com\/.+\/blob\/[0-9a-f]{40}\//);
+  assert.match(dom.window.document.querySelector("#presetNote").textContent, /BPEE revision 0/);
+  const emerald = games.find((game) => game.id === "emerald");
+  const inputs = [...dom.window.document.querySelectorAll("#presetList input")];
+  assert.deepEqual(inputs.map((input) => input.disabled), [...emerald.cheats].map((cheat) => !cheat.verified));
+  assert.equal(dom.window.document.querySelectorAll("#presetList .tag-warn").length, emerald.cheats.filter((cheat) => !cheat.verified).length);
 });

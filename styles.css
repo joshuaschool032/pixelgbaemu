@@ -421,6 +421,7 @@ kbd {
   background: rgba(255,255,255,0.07); color: var(--faint);
   border: 1px solid var(--line);
 }
+.tag-warn { color: #fde9c8; border-color: rgba(251,191,36,.35); background: rgba(251,191,36,.08); }
 .preset-cheat .pc-code {
   font-family: var(--mono); font-size: 0.7rem; color: #9aa3c0;
   margin-top: 3px; white-space: pre-line; word-break: break-all;
@@ -614,7 +615,29 @@ select { appearance: none; background-image: linear-gradient(45deg, transparent 
 ::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.12); border-radius: 10px; border: 2px solid transparent; background-clip: padding-box; }
 ::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.22); background-clip: padding-box; }
 
-/* ============================== UPDATE / ENV BANNERS ============================== */
+/* ============================== STORAGE / CAPABILITIES ============================== */
+.storage-meter { margin-top: 14px; }
+.storage-meter > div { display: flex; justify-content: space-between; gap: 12px; font-size: .78rem; color: var(--muted); }
+.storage-meter progress, .operation-banner progress { width: 100%; height: 8px; margin-top: 7px; accent-color: var(--accent); }
+.storage-warning { color: #fde9c8; margin-top: 9px; padding: 8px 10px; border: 1px solid rgba(251,191,36,.35); border-radius: 9px; background: rgba(251,191,36,.08); }
+.capability-grid { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 12px; }
+.capability { padding: 4px 8px; border-radius: 999px; border: 1px solid var(--line); background: rgba(255,255,255,.035); color: var(--muted); font-size: .72rem; }
+.capability.is-ok { color: #a7f3d0; border-color: rgba(52,211,153,.3); }
+.capability.is-bad { color: #fecdd3; border-color: rgba(251,113,133,.3); }
+
+/* ============================== UPDATE / OPERATION / ENV BANNERS ============================== */
+.operation-banner {
+  position: fixed; top: 82px; left: 50%; transform: translateX(-50%); z-index: 320;
+  display: grid; grid-template-columns: minmax(140px,1fr) minmax(120px, 220px) auto; align-items: center; gap: 12px;
+  width: min(700px, calc(100vw - 32px)); padding: 11px 14px; border-radius: 13px; font-size: .82rem;
+  background: rgba(13, 18, 36, .98); border: 1px solid rgba(139,123,255,.55); box-shadow: var(--shadow);
+}
+.operation-banner[hidden] { display: none; }
+.operation-banner progress { margin: 0; }
+@media (max-width: 860px) {
+  .operation-banner { top: 132px; grid-template-columns: 1fr auto; }
+  .operation-banner progress { grid-column: 1 / -1; grid-row: 2; }
+}
 .update-banner {
   position: fixed; top: 82px; left: 50%; transform: translateX(-50%); z-index: 310;
   display: flex; align-items: center; gap: 12px; width: min(700px, calc(100vw - 32px));

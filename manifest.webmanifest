@@ -1,0 +1,17 @@
+{
+  "id": "./",
+  "name": "PixelGBA",
+  "short_name": "PixelGBA",
+  "description": "A private, offline-first Game Boy Advance emulator for ROMs you legally own.",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#070a14",
+  "theme_color": "#7c6cff",
+  "categories": ["games", "entertainment", "utilities"],
+  "icons": [
+    { "src": "assets/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any maskable" },
+    { "src": "assets/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable" }
+  ]
+}

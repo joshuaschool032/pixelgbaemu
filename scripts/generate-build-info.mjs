@@ -5,11 +5,12 @@ import { fileURLToPath } from "node:url";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const assets = [
-  "./", "./index.html", "./styles.css", "./app.js", "./cheats-db.js",
-  "./loader.js", "./emulator.min.js", "./emulator.min.css", "./version.json",
+  "./", "./index.html", "./styles.css", "./app.js", "./config.js", "./cheats-db.js",
+  "./manifest.webmanifest", "./assets/icon-192.png", "./assets/icon-512.png", "./assets/apple-touch-icon.png",
+  "./pixelgba-worker.js", "./loader.js", "./emulator.min.js", "./emulator.min.css", "./version.json",
   "./en-US.json", "./mgba.json", "./mgba-wasm.data", "./mgba-legacy-wasm.data",
   "./extract7z.js", "./extractzip.js", "./libunrar.js", "./libunrar.wasm",
-  "./sw.js", "./check.html", "./LICENSE", "./THIRD_PARTY_NOTICES.md"
+  "./sw.js", "./check.html", "./SECURITY.md", "./docs/DEVICE_TEST_MATRIX.md", "./docs/CHEAT_PROVENANCE.md", "./LICENSE", "./THIRD_PARTY_NOTICES.md"
 ];
 const hash = createHash("sha256");
 for (const asset of assets.filter((name) => name !== "./")) {

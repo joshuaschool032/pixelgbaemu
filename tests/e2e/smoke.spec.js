@@ -1,8 +1,11 @@
 const { test, expect } = require("@playwright/test");
 const { makeHomebrewRom } = require("../fixtures/make-homebrew-rom");
+const { readFileSync } = require("node:fs");
 
 test("deployment self-check finds every runtime file", async ({ page }) => {
-  await page.goto("/check.html");
+  const response = await page.goto("/check.html");
+  expect(response.headers()["content-security-policy"]).toContain("default-src 'self'");
+  expect(response.headers()["x-content-type-options"]).toBe("nosniff");
   await expect(page.locator("#summary")).toContainText("runtime files passed", { timeout: 30_000 });
   await expect(page.locator("#summary")).toHaveClass(/ok/);
   await expect(page.locator(".row .bad")).toHaveCount(0);
@@ -11,7 +14,9 @@ test("deployment self-check finds every runtime file", async ({ page }) => {
 test("app loads, boots a legal fixture, restores a save, and tears down cleanly", async ({ page, browserName }) => {
   test.skip(browserName !== "chromium", "Linux headless Firefox/WebKit have no compatible mGBA WebGL context; asset and responsive checks still run.");
   const pageErrors = [];
+  let workerRequested = false;
   page.on("pageerror", (error) => pageErrors.push(error.message));
+  page.on("request", (request) => { if (request.url().endsWith("/pixelgba-worker.js")) workerRequested = true; });
   await page.addInitScript(() => {
     const gamepad = { id: "PixelGBA test pad", index: 0, connected: true, mapping: "standard", buttons: Array.from({ length: 16 }, () => ({ pressed: false, value: 0 })), axes: [0, 0, 0, 0], timestamp: 1 };
     Object.defineProperty(navigator, "getGamepads", { configurable: true, value: () => [gamepad] });
@@ -29,6 +34,7 @@ test("app loads, boots a legal fixture, restores a save, and tears down cleanly"
   await page.waitForFunction(() => window.PixelGBA?.state.running === true, null, { timeout: 45_000 });
   await expect(page.locator("#enginePill")).toContainText("Playing");
   await expect(page.locator("#game canvas")).toHaveCount(1);
+  expect(workerRequested).toBe(true);
   await expect.poll(() => page.evaluate(() => Boolean(window.EJS_emulator?.gamepad))).toBe(true);
 
   await page.locator("#savInput").setInputFiles({
@@ -37,6 +43,12 @@ test("app loads, boots a legal fixture, restores a save, and tears down cleanly"
     buffer: Buffer.alloc(64 * 1024, 0x5a),
   });
   await expect(page.locator("#savStatus")).toContainText("synced");
+  await page.locator("#tab-help").click();
+  const backupDownload = page.waitForEvent("download");
+  await page.locator("#btnExportBackup").click();
+  await expect(page.locator("#operationBanner")).toBeHidden({ timeout: 30_000 });
+  expect((await backupDownload).suggestedFilename()).toMatch(/\.pgbackup$/);
+  await page.locator("#tab-library").click();
 
   await page.locator("#btnStop").click();
   await page.waitForFunction(() => window.PixelGBA?.state.running === false && window.PixelGBA?.state.starting === false);
@@ -54,6 +66,32 @@ test("app loads, boots a legal fixture, restores a save, and tears down cleanly"
   await page.waitForFunction(() => window.PixelGBA?.state.running === false && window.PixelGBA?.state.starting === false);
   await expect(page.locator("#savStatus")).toContainText("—");
   expect(pageErrors).toEqual([]);
+});
+
+test("PWA metadata, storage health, and privacy-safe diagnostics are available", async ({ page, request }) => {
+  const manifestResponse = await request.get("/manifest.webmanifest");
+  expect(manifestResponse.ok()).toBe(true);
+  const manifest = await manifestResponse.json();
+  expect(manifest.display).toBe("standalone");
+  expect(manifest.icons).toHaveLength(2);
+
+  await page.goto("/");
+  await page.locator("#tab-help").click();
+  await expect(page.locator("#storagePersistBadge")).not.toContainText("checking");
+  await expect(page.locator("#capabilityGrid .capability")).toHaveCount(8);
+  await page.evaluate(() => window.dispatchEvent(new ErrorEvent("error", { message: "private-game.gba failed at https://private.example/user" })));
+  const diagnosticDownload = page.waitForEvent("download");
+  await page.locator("#btnExportDiagnostics").click();
+  const download = await diagnosticDownload;
+  const report = JSON.parse(readFileSync(await download.path(), "utf8"));
+  expect(report.format).toBe("pixelgba-diagnostics-v1");
+  expect(report.app.version).toBe("1.3.0");
+  expect(report).not.toHaveProperty("url");
+  expect(report.browser).not.toHaveProperty("userAgent");
+  expect(report.recentErrors.at(-1)).toEqual(expect.objectContaining({ category: "application-error" }));
+  expect(report.recentErrors.at(-1)).not.toHaveProperty("message");
+  expect(JSON.stringify(report)).not.toContain("private-game");
+  expect(JSON.stringify(report)).not.toContain("private.example");
 });
 
 test("library controls fit the configured desktop or mobile viewport", async ({ page }) => {
