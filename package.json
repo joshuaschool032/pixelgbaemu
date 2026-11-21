@@ -19,8 +19,8 @@
     "test:all": "npm run check && npm test && npm run test:e2e"
   },
   "devDependencies": {
-    "@playwright/test": "1.56.1",
-    "@sparticuz/chromium": "141.0.0",
+    "@playwright/test": "1.65.1",
+    "@sparticuz/chromium": "153.0.0",
     "fake-indexeddb": "6.2.4",
     "jsdom": "27.2.0"
   }
