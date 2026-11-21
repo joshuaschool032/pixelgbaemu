@@ -34,31 +34,31 @@
     </div>
   </div>
 
-  <nav class="tabs" aria-label="Sections">
-    <button class="tab is-active" data-view="library">
+  <nav class="tabs" aria-label="Sections" role="tablist">
+    <button type="button" class="tab is-active" id="tab-library" data-view="library" role="tab" aria-controls="view-library" aria-selected="true">
       <svg viewBox="0 0 24 24" class="ico"><path d="M4 5.5A2.5 2.5 0 0 1 6.5 3H20v15.5A2.5 2.5 0 0 1 17.5 21H6.5A2.5 2.5 0 0 1 4 18.5v-13Z" stroke="currentColor" stroke-width="1.6" fill="none"/><path d="M4 17.5A2.5 2.5 0 0 1 6.5 15H20" stroke="currentColor" stroke-width="1.6" fill="none"/></svg>
       Library
     </button>
-    <button class="tab" data-view="cheats">
+    <button type="button" class="tab" id="tab-cheats" data-view="cheats" role="tab" aria-controls="view-cheats" aria-selected="false" tabindex="-1">
       <svg viewBox="0 0 24 24" class="ico"><path d="M12 3v18M3 12h18" stroke="currentColor" stroke-width="1.6"/><circle cx="12" cy="12" r="8.2" stroke="currentColor" stroke-width="1.6" fill="none"/></svg>
       Cheats
     </button>
-    <button class="tab" data-view="saves">
+    <button type="button" class="tab" id="tab-saves" data-view="saves" role="tab" aria-controls="view-saves" aria-selected="false" tabindex="-1">
       <svg viewBox="0 0 24 24" class="ico"><path d="M5 4h11l3 3v13H5V4Z" stroke="currentColor" stroke-width="1.6" fill="none"/><path d="M8 4v5h7V4M8 20v-6h8v6" stroke="currentColor" stroke-width="1.6" fill="none"/></svg>
       Saves
     </button>
-    <button class="tab" data-view="help">
+    <button type="button" class="tab" id="tab-help" data-view="help" role="tab" aria-controls="view-help" aria-selected="false" tabindex="-1">
       <svg viewBox="0 0 24 24" class="ico"><circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="1.6" fill="none"/><path d="M9.6 9.3a2.5 2.5 0 1 1 3.4 2.9c-.7.35-1 1-1 1.8" stroke="currentColor" stroke-width="1.6" fill="none"/><circle cx="12" cy="17" r="1" fill="currentColor"/></svg>
       Help
     </button>
   </nav>
 
-  <div class="engine-pill" id="enginePill"><i></i><span>Engine ready · offline</span></div>
+  <div class="engine-pill" id="enginePill" aria-live="polite"><i></i><span>Engine ready · offline</span></div>
 </header>
 
 <main>
   <!-- ============================== LIBRARY ============================== -->
-  <section class="view is-active" id="view-library">
+  <section class="view is-active" id="view-library" role="tabpanel" aria-labelledby="tab-library">
     <div class="library-grid">
       <!-- Player / console -->
       <div class="panel player-panel">
@@ -82,11 +82,11 @@
                   <p class="boot-title">Drop in a Game Boy Advance ROM</p>
                   <p class="boot-sub">Supports <b>.gba</b> · .agb · .bin · zipped ROMs</p>
                   <div class="boot-actions">
-                    <button class="btn btn-primary" id="bootBrowse">
+                    <button type="button" class="btn btn-primary" id="bootBrowse">
                       <svg viewBox="0 0 24 24" class="ico"><path d="M12 16V4m0 0-4 4m4-4 4 4M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2" stroke="currentColor" stroke-width="1.7" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
                       Choose ROM file
                     </button>
-                    <button class="btn btn-ghost" id="bootPlayAgain" hidden>
+                    <button type="button" class="btn btn-ghost" id="bootPlayAgain" hidden>
                       <svg viewBox="0 0 24 24" class="ico"><path d="M8 5.5v13l11-6.5-11-6.5Z" stroke="currentColor" stroke-width="1.6" fill="none" stroke-linejoin="round"/></svg>
                       <span>Play again</span>
                     </button>
@@ -107,15 +107,15 @@
         </div>
 
         <div class="player-toolbar">
-          <button class="btn btn-ghost" id="btnRestart" title="Restart the current game">
+          <button type="button" class="btn btn-ghost" id="btnRestart" title="Restart the current game">
             <svg viewBox="0 0 24 24" class="ico"><path d="M20 12a8 8 0 1 1-2.34-5.66M20 4v4h-4" stroke="currentColor" stroke-width="1.7" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
             Restart
           </button>
-          <button class="btn btn-ghost" id="btnStop" title="Stop the game and return to library">
+          <button type="button" class="btn btn-ghost" id="btnStop" title="Stop the game and return to library">
             <svg viewBox="0 0 24 24" class="ico"><rect x="7" y="7" width="10" height="10" rx="1.5" stroke="currentColor" stroke-width="1.7" fill="none"/></svg>
             Stop
           </button>
-          <button class="btn btn-ghost" id="btnShot" title="Save a screenshot of the current frame">
+          <button type="button" class="btn btn-ghost" id="btnShot" title="Save a screenshot of the current frame">
             <svg viewBox="0 0 24 24" class="ico"><path d="M4 8h3l2-2h6l2 2h3v11H4V8Z" stroke="currentColor" stroke-width="1.6" fill="none"/><circle cx="12" cy="13" r="3.2" stroke="currentColor" stroke-width="1.6" fill="none"/></svg>
             Screenshot
           </button>
@@ -131,16 +131,17 @@
             <h2>Your games</h2>
             <span class="count" id="romCount">0</span>
           </div>
-          <label class="dropzone" id="dropZone">
+          <div class="dropzone" id="dropZone" role="button" tabindex="0" aria-describedby="dropHelp">
             <input type="file" id="romInput" accept=".gba,.agb,.bin,.zip,.7z,application/octet-stream" hidden />
             <svg viewBox="0 0 24 24" class="drop-ico"><path d="M12 16V4m0 0-4 4m4-4 4 4" stroke="currentColor" stroke-width="1.7" fill="none" stroke-linecap="round" stroke-linejoin="round"/><path d="M4 15v3a3 3 0 0 0 3 3h10a3 3 0 0 0 3-3v-3" stroke="currentColor" stroke-width="1.7" fill="none" stroke-linecap="round"/></svg>
             <span class="drop-main">Drop a <b>.gba</b> ROM here</span>
-            <span class="drop-sub">or click to browse — files stay on your PC</span>
-          </label>
-          <div class="recent" id="recentList"></div>
+            <span class="drop-sub" id="dropHelp">or click to browse — files stay on your PC</span>
+          </div>
+          <div class="recent" id="recentList" aria-label="Your ROM library"></div>
+          <p class="tiny muted library-note">× removes only the library entry; 🗑 deletes the game and all of its local data.</p>
           <div class="panel-actions">
-            <button class="btn btn-ghost btn-sm" id="btnQuickImportSav" title="Load a .sav battery file for the selected game">Import .sav</button>
-            <button class="btn btn-ghost btn-sm" id="btnQuickLoadState" title="Load a save state file">Load state</button>
+            <button type="button" class="btn btn-ghost btn-sm" id="btnQuickImportSav" title="Load a .sav battery file for the selected game">Import .sav</button>
+            <button type="button" class="btn btn-ghost btn-sm" id="btnQuickLoadState" title="Load a save state file">Load state</button>
           </div>
         </div>
 
@@ -161,7 +162,7 @@
   </section>
 
   <!-- ============================== CHEATS ============================== -->
-  <section class="view" id="view-cheats">
+  <section class="view" id="view-cheats" role="tabpanel" aria-labelledby="tab-cheats" hidden>
     <div class="two-col">
       <div class="panel">
         <div class="panel-head">
@@ -210,8 +211,8 @@
         <div id="activeList" class="active-list"></div>
         <div class="divider"></div>
         <div class="mini-actions">
-          <button class="btn btn-ghost btn-sm" id="btnReapply">Re-apply enabled</button>
-          <button class="btn btn-ghost btn-sm" id="btnClearCheats">Remove all</button>
+          <button type="button" class="btn btn-ghost btn-sm" id="btnReapply">Re-apply enabled</button>
+          <button type="button" class="btn btn-ghost btn-sm" id="btnClearCheats">Remove all</button>
         </div>
         <p class="tiny muted">Some cheats must be turned off before saving. Save states remember the cheat state, battery saves don't.</p>
       </div>
@@ -219,7 +220,7 @@
   </section>
 
   <!-- ============================== SAVES ============================== -->
-  <section class="view" id="view-saves">
+  <section class="view" id="view-saves" role="tabpanel" aria-labelledby="tab-saves" hidden>
     <div class="two-col">
       <div class="panel">
         <div class="panel-head">
@@ -230,8 +231,8 @@
         <div class="slots" id="slotGrid"></div>
         <div class="divider"></div>
         <div class="mini-actions">
-          <button class="btn btn-ghost btn-sm" id="btnImportState">Import state file…</button>
-          <button class="btn btn-ghost btn-sm" id="btnExportState">Export latest…</button>
+          <button type="button" class="btn btn-ghost btn-sm" id="btnImportState">Import state file…</button>
+          <button type="button" class="btn btn-ghost btn-sm" id="btnExportState">Export latest…</button>
           <input type="file" id="stateInput" accept=".state,application/octet-stream" hidden />
         </div>
       </div>
@@ -252,9 +253,9 @@
           </div>
         </div>
         <div class="mini-actions">
-          <button class="btn btn-ghost btn-sm" id="btnExportSav">Export .sav</button>
-          <button class="btn btn-ghost btn-sm" id="btnImportSav">Import .sav</button>
-          <button class="btn btn-ghost btn-sm btn-danger" id="btnDeleteSav">Delete stored .sav</button>
+          <button type="button" class="btn btn-ghost btn-sm" id="btnExportSav">Export .sav</button>
+          <button type="button" class="btn btn-ghost btn-sm" id="btnImportSav">Import .sav</button>
+          <button type="button" class="btn btn-ghost btn-sm btn-danger" id="btnDeleteSav">Delete stored .sav</button>
           <input type="file" id="savInput" accept=".sav,.dsv,.bin,application/octet-stream" hidden />
         </div>
         <div class="divider"></div>
@@ -269,7 +270,7 @@
   </section>
 
   <!-- ============================== HELP ============================== -->
-  <section class="view" id="view-help">
+  <section class="view" id="view-help" role="tabpanel" aria-labelledby="tab-help" hidden>
     <div class="help-grid">
       <div class="panel">
         <h2>Quick start</h2>
@@ -319,7 +320,7 @@ B505DB41 6E39EA4E</pre><p class="tiny muted">8 + 4 hex digits (some CB codes are
       <div class="panel">
         <h2>Saves, states &amp; backups</h2>
         <div class="kv">
-          <div><b>Save states</b><p>5 slots per game + unlimited file exports (<code>.state</code>). Captures RAM exactly, including cheat effects. Load one from the Saves tab or drop a <code>.state</code> file in.</p></div>
+          <div><b>Save states</b><p>5 slots per game + file exports (<code>.state</code>). Captures RAM exactly, including cheat effects. Import a compatible state from the Saves tab while its matching game is running.</p></div>
           <div><b>Battery saves</b><p>The game's own save file (<code>.sav</code>). Auto-synced to your PC, restored on launch, portable to other emulators and hardware. Export it before you experiment.</p></div>
           <div><b>Where it lives</b><p>All ROMs, saves and states stay in your browser's private storage on this PC (IndexedDB + localStorage). Clearing site data wipes them — export anything precious.</p></div>
         </div>
@@ -327,13 +328,13 @@ B505DB41 6E39EA4E</pre><p class="tiny muted">8 + 4 hex digits (some CB codes are
 
       <div class="panel">
         <h2>About &amp; legal</h2>
-        <p class="muted small">PixelGBA is a front-end built on <b>EmulatorJS 4.2.3</b> driving the <b>mGBA</b> core (both MIT/GPL open source). The engine and core are bundled locally, so it works offline after download. No ROMs, BIOS files or copyrighted content are included or downloaded.</p>
-        <p class="muted small">Only play ROMs of games you legally own. Pokémon © Nintendo / Creatures Inc. / GAME FREAK inc. This app is not affiliated with Nintendo.</p>
+        <p class="muted small">PixelGBA is a GPL-3.0 front-end built on <b>EmulatorJS 4.2.3</b> (GPL-3.0) driving the <b>mGBA</b> core (MPL-2.0). The engine and core are bundled locally, so gameplay works offline after download. No ROMs or BIOS files are included or downloaded.</p>
+        <p class="muted small">Only play ROMs of games you legally own. Pokémon © Nintendo / Creatures Inc. / GAME FREAK inc. This app is not affiliated with Nintendo. See <a href="LICENSE" style="color:#cfc8ff">LICENSE</a> and <a href="THIRD_PARTY_NOTICES.md" style="color:#cfc8ff">third-party notices</a> for source and license details.</p>
         <h3 class="panel-title">Something not working?</h3>
         <p class="muted small">Open the <a href="check.html" style="color:#cfc8ff">self-check page</a> — it verifies every engine file this deployment needs and names the exact one that's missing.</p>
         <div class="mini-actions">
           <a class="btn btn-ghost btn-sm" href="check.html">Run self-check</a>
-          <button class="btn btn-ghost btn-sm" id="btnWipe" title="Remove ROMs, saves, states and settings from this browser">Clear all local data</button>
+          <button type="button" class="btn btn-ghost btn-sm" id="btnWipe" title="Remove ROMs, saves, states and settings from this browser">Clear all local data</button>
         </div>
       </div>
     </div>
@@ -345,7 +346,7 @@ B505DB41 6E39EA4E</pre><p class="tiny muted">8 + 4 hex digits (some CB codes are
   <div>
     <span id="envBannerBody"><b>Preview mode.</b> This page is embedded in a sandboxed frame, so the emulator's engine files are blocked here.</span>
   </div>
-  <button class="env-close" id="envClose" aria-label="Dismiss">×</button>
+  <button type="button" class="env-close" id="envClose" aria-label="Dismiss">×</button>
 </div>
 <div class="toasts" id="toasts" aria-live="polite"></div>
 

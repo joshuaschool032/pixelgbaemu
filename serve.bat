@@ -5,6 +5,10 @@ title PixelGBA launcher
 
 set "PORT=8080"
 if not "%~1"=="" set "PORT=%~1"
+echo(%PORT%| findstr /r "^[1-9][0-9]*$" >nul || (
+  echo [X] Port must be a number from 1 to 65535.
+  exit /b 2
+)
 
 echo ==========================================================
 echo   PixelGBA - starting the local server
@@ -28,14 +32,14 @@ set "KIND="
 
 py -3 -c "import sys" >nul 2>&1
 if not errorlevel 1 (
-  set "RUN=py -3 -m http.server %PORT%"
+  set "RUN=py -3 -m http.server %PORT% --bind 127.0.0.1"
   set "KIND=Python launcher (py)"
 )
 
 if not defined RUN (
   node -e "process.exit(0)" >nul 2>&1
   if not errorlevel 1 (
-    set "RUN=node serve.js %PORT%"
+    set "RUN=node serve.js %PORT% 127.0.0.1"
     set "KIND=Node.js"
   )
 )
@@ -43,7 +47,7 @@ if not defined RUN (
 if not defined RUN (
   python -c "import sys" >nul 2>&1
   if not errorlevel 1 (
-    set "RUN=python -m http.server %PORT%"
+    set "RUN=python -m http.server %PORT% --bind 127.0.0.1"
     set "KIND=Python"
   )
 )

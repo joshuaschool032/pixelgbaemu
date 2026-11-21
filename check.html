@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>PixelGBA deployment self-check</title>
+<style>
+:root{color-scheme:dark;font-family:system-ui,sans-serif;background:#090b14;color:#eef1ff}body{max-width:900px;margin:auto;padding:32px 18px}a{color:#bcb3ff}.card{background:#121625;border:1px solid #29304a;border-radius:16px;padding:20px}.summary{font-size:1.05rem;margin:12px 0 20px}.list{display:grid;gap:7px}.row{display:grid;grid-template-columns:24px minmax(150px,1fr) auto;gap:10px;align-items:center;padding:9px 11px;border-radius:9px;background:#0c101c}.ok{color:#55e6a5}.bad{color:#ff8297}.wait{color:#f8ce67}code{font-size:.84rem;overflow-wrap:anywhere}.detail{color:#99a3c1;font-size:.8rem;text-align:right}button,.button{display:inline-block;border:1px solid #4d5680;border-radius:9px;padding:8px 12px;background:#202642;color:#fff;text-decoration:none;cursor:pointer;font:inherit}button:focus-visible,.button:focus-visible,a:focus-visible{outline:2px solid #9a8cff;outline-offset:2px}@media(max-width:550px){.row{grid-template-columns:24px 1fr}.detail{grid-column:2;text-align:left}}
+</style>
+</head>
+<body>
+<h1>PixelGBA self-check</h1>
+<p>This checks every local runtime asset. It does not inspect or upload ROMs or saves.</p>
+<div class="card">
+  <div class="summary wait" id="summary" aria-live="polite">Checking bundled files…</div>
+  <div class="list" id="results"></div>
+</div>
+<p><button type="button" id="rerun">Run again</button> <a class="button" href="index.html">Back to PixelGBA</a></p>
+<script>
+const assets = {
+  "index.html": 0, "styles.css": 0, "app.js": 0, "cheats-db.js": 0,
+  "loader.js": 0, "emulator.min.js": 400000, "emulator.min.css": 20000,
+  "version.json": 50, "en-US.json": 5000, "mgba.json": 50,
+  "mgba-wasm.data": 1000000, "mgba-legacy-wasm.data": 1000000,
+  "extract7z.js": 250000, "extractzip.js": 170000, "libunrar.js": 50000,
+  "libunrar.wasm": 150000, "sw.js": 500
+};
+const fmt = n => n >= 1048576 ? (n/1048576).toFixed(2)+" MB" : n >= 1024 ? (n/1024).toFixed(1)+" KB" : n+" B";
+async function inspect(name, minimum) {
+  try {
+    const response = await fetch(name + "?self-check=" + Date.now(), { cache: "no-store" });
+    if (!response.ok) throw new Error("HTTP " + response.status);
+    const data = await response.arrayBuffer();
+    if (data.byteLength < minimum) throw new Error("only " + fmt(data.byteLength) + "; expected at least " + fmt(minimum));
+    if (name.endsWith(".json")) JSON.parse(new TextDecoder().decode(data));
+    return { ok: true, detail: fmt(data.byteLength) };
+  } catch (error) { return { ok: false, detail: error.message }; }
+}
+async function run() {
+  const box = document.querySelector("#results");
+  const summary = document.querySelector("#summary");
+  box.innerHTML = ""; summary.className = "summary wait"; summary.textContent = "Checking bundled files…";
+  let passed = 0;
+  for (const [name, minimum] of Object.entries(assets)) {
+    const row = document.createElement("div"); row.className = "row";
+    row.innerHTML = '<span class="wait">…</span><code></code><span class="detail">checking</span>';
+    row.querySelector("code").textContent = name; box.appendChild(row);
+    const result = await inspect(name, minimum);
+    row.firstElementChild.textContent = result.ok ? "✓" : "×";
+    row.firstElementChild.className = result.ok ? "ok" : "bad";
+    row.lastElementChild.textContent = result.detail;
+    if (result.ok) passed++;
+  }
+  const total = Object.keys(assets).length;
+  summary.textContent = passed === total ? `All ${total} runtime files passed. This deployment is complete.` : `${passed}/${total} files passed. Re-upload or restore every failed file.`;
+  summary.className = "summary " + (passed === total ? "ok" : "bad");
+}
+document.querySelector("#rerun").addEventListener("click", run);
+run();
+</script>
+</body>
+</html>

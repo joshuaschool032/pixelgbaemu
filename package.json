@@ -1,0 +1,23 @@
+{
+  "name": "pixelgba",
+  "version": "1.1.0",
+  "private": true,
+  "description": "Static Game Boy Advance emulator UI using EmulatorJS and mGBA",
+  "license": "GPL-3.0-only",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "serve": "node serve.js 8080",
+    "check": "node scripts/check-assets.mjs",
+    "test": "node --test tests/unit/*.test.mjs",
+    "test:e2e": "node scripts/run-e2e.mjs",
+    "test:all": "npm run check && npm test && npm run test:e2e"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.56.1",
+    "@sparticuz/chromium": "141.0.0",
+    "fake-indexeddb": "6.2.4",
+    "jsdom": "27.2.0"
+  }
+}
