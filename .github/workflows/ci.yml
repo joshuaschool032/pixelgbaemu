@@ -24,6 +24,8 @@ jobs:
 
   cross-browser:
     runs-on: ubuntu-latest
+    container:
+      image: mcr.microsoft.com/playwright:v1.56.1-noble
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -32,5 +34,4 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
-      - run: npx playwright install --with-deps firefox webkit
       - run: npm run test:e2e:cross-browser
