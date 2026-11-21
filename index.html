@@ -1,0 +1,356 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>PixelGBA — Game Boy Advance Emulator</title>
+<meta name="description" content="A Game Boy Advance emulator for your PC. Play .gba ROMs, save anytime, and use built-in Pokémon cheat codes. Runs fully offline." />
+<link rel="stylesheet" href="css/styles.css" />
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect x='6' y='10' width='52' height='44' rx='10' fill='%237c6cff'/%3E%3Crect x='14' y='18' width='36' height='24' rx='4' fill='%230b1020'/%3E%3Ccircle cx='24' cy='47' r='3' fill='%23a3e635'/%3E%3Ccircle cx='40' cy='47' r='3' fill='%23f472b6'/%3E%3C/svg%3E" />
+</head>
+<body>
+<div class="bg-deco" aria-hidden="true"></div>
+
+<!-- ============================== TOP BAR ============================== -->
+<header class="topbar">
+  <div class="brand">
+    <span class="brand-chip" aria-hidden="true">
+      <svg viewBox="0 0 64 64" width="34" height="34" fill="none">
+        <rect x="4" y="10" width="56" height="44" rx="10" fill="url(#bg1)"/>
+        <rect x="13" y="18" width="38" height="24" rx="4" fill="#0b1020"/>
+        <rect x="18" y="23" width="28" height="14" rx="2" fill="#1c2742"/>
+        <circle cx="23" cy="47" r="3" fill="#a3e635"/>
+        <circle cx="41" cy="47" r="3" fill="#f472b6"/>
+        <defs>
+          <linearGradient id="bg1" x1="4" y1="10" x2="60" y2="54" gradientUnits="userSpaceOnUse">
+            <stop stop-color="#8b7bff"/><stop offset="1" stop-color="#5b4bd6"/>
+          </linearGradient>
+        </defs>
+      </svg>
+    </span>
+    <div class="brand-text">
+      <h1>PixelGBA</h1>
+      <p>Game Boy Advance emulator for PC</p>
+    </div>
+  </div>
+
+  <nav class="tabs" aria-label="Sections">
+    <button class="tab is-active" data-view="library">
+      <svg viewBox="0 0 24 24" class="ico"><path d="M4 5.5A2.5 2.5 0 0 1 6.5 3H20v15.5A2.5 2.5 0 0 1 17.5 21H6.5A2.5 2.5 0 0 1 4 18.5v-13Z" stroke="currentColor" stroke-width="1.6" fill="none"/><path d="M4 17.5A2.5 2.5 0 0 1 6.5 15H20" stroke="currentColor" stroke-width="1.6" fill="none"/></svg>
+      Library
+    </button>
+    <button class="tab" data-view="cheats">
+      <svg viewBox="0 0 24 24" class="ico"><path d="M12 3v18M3 12h18" stroke="currentColor" stroke-width="1.6"/><circle cx="12" cy="12" r="8.2" stroke="currentColor" stroke-width="1.6" fill="none"/></svg>
+      Cheats
+    </button>
+    <button class="tab" data-view="saves">
+      <svg viewBox="0 0 24 24" class="ico"><path d="M5 4h11l3 3v13H5V4Z" stroke="currentColor" stroke-width="1.6" fill="none"/><path d="M8 4v5h7V4M8 20v-6h8v6" stroke="currentColor" stroke-width="1.6" fill="none"/></svg>
+      Saves
+    </button>
+    <button class="tab" data-view="help">
+      <svg viewBox="0 0 24 24" class="ico"><circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="1.6" fill="none"/><path d="M9.6 9.3a2.5 2.5 0 1 1 3.4 2.9c-.7.35-1 1-1 1.8" stroke="currentColor" stroke-width="1.6" fill="none"/><circle cx="12" cy="17" r="1" fill="currentColor"/></svg>
+      Help
+    </button>
+  </nav>
+
+  <div class="engine-pill" id="enginePill"><i></i><span>Engine ready · offline</span></div>
+</header>
+
+<main>
+  <!-- ============================== LIBRARY ============================== -->
+  <section class="view is-active" id="view-library">
+    <div class="library-grid">
+      <!-- Player / console -->
+      <div class="panel player-panel">
+        <div class="console-shell" id="consoleShell">
+          <div class="shoulder-row" aria-hidden="true">
+            <span class="shoulder">L</span>
+            <span class="shoulder">R</span>
+          </div>
+          <div class="bezel">
+            <div class="bezel-top">
+              <span class="led"><i></i>POWER</span>
+              <span class="bezel-title">dot-matrix with backlight</span>
+            </div>
+            <div class="screen">
+              <div id="game" aria-label="Emulator screen"></div>
+              <div class="boot" id="bootScreen">
+                <div class="boot-inner">
+                  <div class="boot-logo">
+                    <span class="pix">PIXEL</span><span class="gb">GBA</span>
+                  </div>
+                  <p class="boot-title">Drop in a Game Boy Advance ROM</p>
+                  <p class="boot-sub">Supports <b>.gba</b> · .agb · .bin · zipped ROMs</p>
+                  <div class="boot-actions">
+                    <button class="btn btn-primary" id="bootBrowse">
+                      <svg viewBox="0 0 24 24" class="ico"><path d="M12 16V4m0 0-4 4m4-4 4 4M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2" stroke="currentColor" stroke-width="1.7" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                      Choose ROM file
+                    </button>
+                    <button class="btn btn-ghost" id="bootPlayAgain" hidden>
+                      <svg viewBox="0 0 24 24" class="ico"><path d="M8 5.5v13l11-6.5-11-6.5Z" stroke="currentColor" stroke-width="1.6" fill="none" stroke-linejoin="round"/></svg>
+                      <span>Play again</span>
+                    </button>
+                  </div>
+                  <p class="boot-note">Nothing leaves your PC — the emulator runs 100% locally.</p>
+                </div>
+              </div>
+            </div>
+            <div class="bezel-bottom">
+              <span class="power-dot"></span>
+              <span class="power-label">GAME BOY ADVANCE</span>
+            </div>
+          </div>
+          <div class="console-brand">
+            <span class="wordmark">GAME BOY <b>ADVANCE</b></span>
+            <span class="studio">PixelGBA</span>
+          </div>
+        </div>
+
+        <div class="player-toolbar">
+          <button class="btn btn-ghost" id="btnRestart" title="Restart the current game">
+            <svg viewBox="0 0 24 24" class="ico"><path d="M20 12a8 8 0 1 1-2.34-5.66M20 4v4h-4" stroke="currentColor" stroke-width="1.7" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            Restart
+          </button>
+          <button class="btn btn-ghost" id="btnStop" title="Stop the game and return to library">
+            <svg viewBox="0 0 24 24" class="ico"><rect x="7" y="7" width="10" height="10" rx="1.5" stroke="currentColor" stroke-width="1.7" fill="none"/></svg>
+            Stop
+          </button>
+          <button class="btn btn-ghost" id="btnShot" title="Save a screenshot of the current frame">
+            <svg viewBox="0 0 24 24" class="ico"><path d="M4 8h3l2-2h6l2 2h3v11H4V8Z" stroke="currentColor" stroke-width="1.6" fill="none"/><circle cx="12" cy="13" r="3.2" stroke="currentColor" stroke-width="1.6" fill="none"/></svg>
+            Screenshot
+          </button>
+          <span class="toolbar-spacer"></span>
+          <span class="toolbar-hint" id="toolbarHint">No game loaded</span>
+        </div>
+      </div>
+
+      <!-- Side column -->
+      <div class="side-col">
+        <div class="panel">
+          <div class="panel-head">
+            <h2>Your games</h2>
+            <span class="count" id="romCount">0</span>
+          </div>
+          <label class="dropzone" id="dropZone">
+            <input type="file" id="romInput" accept=".gba,.agb,.bin,.zip,.7z,application/octet-stream" hidden />
+            <svg viewBox="0 0 24 24" class="drop-ico"><path d="M12 16V4m0 0-4 4m4-4 4 4" stroke="currentColor" stroke-width="1.7" fill="none" stroke-linecap="round" stroke-linejoin="round"/><path d="M4 15v3a3 3 0 0 0 3 3h10a3 3 0 0 0 3-3v-3" stroke="currentColor" stroke-width="1.7" fill="none" stroke-linecap="round"/></svg>
+            <span class="drop-main">Drop a <b>.gba</b> ROM here</span>
+            <span class="drop-sub">or click to browse — files stay on your PC</span>
+          </label>
+          <div class="recent" id="recentList"></div>
+          <div class="panel-actions">
+            <button class="btn btn-ghost btn-sm" id="btnQuickImportSav" title="Load a .sav battery file for the selected game">Import .sav</button>
+            <button class="btn btn-ghost btn-sm" id="btnQuickLoadState" title="Load a save state file">Load state</button>
+          </div>
+        </div>
+
+        <div class="panel">
+          <h3 class="panel-title">Default controls</h3>
+          <div class="keys">
+            <div class="keyrow"><span class="kbd-group"><kbd>↑</kbd><kbd>↓</kbd><kbd>←</kbd><kbd>→</kbd></span><span>D-Pad</span></div>
+            <div class="keyrow"><span class="kbd-group"><kbd>Z</kbd></span><span>A button</span></div>
+            <div class="keyrow"><span class="kbd-group"><kbd>X</kbd></span><span>B button</span></div>
+            <div class="keyrow"><span class="kbd-group"><kbd>Enter</kbd></span><span>Start</span></div>
+            <div class="keyrow"><span class="kbd-group"><kbd>V</kbd></span><span>Select</span></div>
+            <div class="keyrow"><span class="kbd-group"><kbd>Q</kbd><kbd>E</kbd></span><span>L / R shoulder</span></div>
+          </div>
+          <p class="tiny muted">Remap keys or plug in a USB gamepad in the emulator's ⚙︎ Settings menu. F1 opens the quick menu.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================== CHEATS ============================== -->
+  <section class="view" id="view-cheats">
+    <div class="two-col">
+      <div class="panel">
+        <div class="panel-head">
+          <h2>Cheats</h2>
+          <span class="badge" id="cheatGameBadge">no game loaded</span>
+        </div>
+        <p class="muted small">Codes are applied live by the mGBA core — toggle them on and the effect lands in-game (usually after opening a menu or buying at a PokéMart). Everything is stored per game.</p>
+
+        <div class="preset-picker" id="presetGames"></div>
+        <div class="preset-note" id="presetNote"></div>
+        <div class="preset-list" id="presetList"></div>
+
+        <details class="custom-cheat">
+          <summary>Add a custom cheat code</summary>
+          <form id="customCheatForm" autocomplete="off">
+            <div class="form-row">
+              <label class="field">
+                <span>Description</span>
+                <input type="text" id="ccName" placeholder="e.g. Shiny wild Pokémon" maxlength="64" required />
+              </label>
+              <label class="field field-narrow">
+                <span>Type</span>
+                <select id="ccType">
+                  <option value="gs">GameShark / AR</option>
+                  <option value="cb">CodeBreaker</option>
+                </select>
+              </label>
+            </div>
+            <label class="field">
+              <span>Code (hex — spaces optional)</span>
+              <textarea id="ccCode" rows="3" placeholder="82025840 0044" required></textarea>
+            </label>
+            <div class="form-row form-actions">
+              <button type="submit" class="btn btn-primary btn-sm">Add cheat</button>
+              <span class="tiny muted" id="ccHint">GameShark: 8+8 hex per line · CodeBreaker: 8+4 hex per line</span>
+            </div>
+          </form>
+        </details>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head">
+          <h2>This game's cheat list</h2>
+          <span class="count" id="cheatCount">0</span>
+        </div>
+        <div id="activeList" class="active-list"></div>
+        <div class="divider"></div>
+        <div class="mini-actions">
+          <button class="btn btn-ghost btn-sm" id="btnReapply">Re-apply enabled</button>
+          <button class="btn btn-ghost btn-sm" id="btnClearCheats">Remove all</button>
+        </div>
+        <p class="tiny muted">Some cheats must be turned off before saving. Save states remember the cheat state, battery saves don't.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================== SAVES ============================== -->
+  <section class="view" id="view-saves">
+    <div class="two-col">
+      <div class="panel">
+        <div class="panel-head">
+          <h2>Save states</h2>
+          <span class="badge" id="stateGameBadge">no game loaded</span>
+        </div>
+        <p class="muted small">Snapshots of the exact moment — anywhere in the game, no save point needed. Stored on your PC and kept between sessions.</p>
+        <div class="slots" id="slotGrid"></div>
+        <div class="divider"></div>
+        <div class="mini-actions">
+          <button class="btn btn-ghost btn-sm" id="btnImportState">Import state file…</button>
+          <button class="btn btn-ghost btn-sm" id="btnExportState">Export latest…</button>
+          <input type="file" id="stateInput" accept=".state,application/octet-stream" hidden />
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head">
+          <h2>Battery save (.sav)</h2>
+          <span class="badge" id="savStatus">—</span>
+        </div>
+        <p class="muted small">Pokémon's own in-game Save writes a battery file. PixelGBA auto-syncs it to your PC every few seconds and restores it when you load the ROM again.</p>
+        <div class="sav-card">
+          <div class="sav-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24"><path d="M5 4h11l3 3v13H5V4Z" stroke="currentColor" stroke-width="1.5" fill="none"/><path d="M8 4v5h7V4M8 20v-6h8v6" stroke="currentColor" stroke-width="1.5" fill="none"/></svg>
+          </div>
+          <div class="sav-meta">
+            <b id="savName">No .sav stored yet</b>
+            <span class="tiny muted" id="savInfo">Play and save in-game — the file appears here automatically.</span>
+          </div>
+        </div>
+        <div class="mini-actions">
+          <button class="btn btn-ghost btn-sm" id="btnExportSav">Export .sav</button>
+          <button class="btn btn-ghost btn-sm" id="btnImportSav">Import .sav</button>
+          <button class="btn btn-ghost btn-sm btn-danger" id="btnDeleteSav">Delete stored .sav</button>
+          <input type="file" id="savInput" accept=".sav,.dsv,.bin,application/octet-stream" hidden />
+        </div>
+        <div class="divider"></div>
+        <h3 class="panel-title">Tips</h3>
+        <ul class="tips">
+          <li>Battery saves are compatible with VBA-M, mGBA, visual retro handhelds and real cartridges via a dumper.</li>
+          <li>Save states are <b>not</b> portable to other emulators — use the .sav for that.</li>
+          <li>Back up before big cheats: export the .sav, then go wild.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================== HELP ============================== -->
+  <section class="view" id="view-help">
+    <div class="help-grid">
+      <div class="panel">
+        <h2>Quick start</h2>
+        <ol class="steps">
+          <li><b>Get a ROM</b> — a <code>.gba</code> file of a game you own. PixelGBA ships with none, for obvious reasons; dump your own cartridge with a tool like GB Operator or rip from a cart you legally own.</li>
+          <li><b>Drop it in</b> — drag the file onto the drop zone (or click <i>Choose ROM file</i>). The game boots immediately.</li>
+          <li><b>Save</b> — save states from the Saves tab, battery saves are automatic.</li>
+          <li><b>Cheat</b> — open the Cheats tab, pick your Pokémon game's preset or paste a GameShark / CodeBreaker code.</li>
+        </ol>
+
+        <h3 class="panel-title">ROM not loading?</h3>
+        <ul class="tips">
+          <li>Only <code>.gba</code>, <code>.agb</code>, <code>.bin</code> and zipped copies are supported — this is a GBA emulator, not a DS or SNES one.</li>
+          <li>If the screen stays black, try unzipping the ROM first.</li>
+          <li>Extremely large (32 MB+) patched ROM hacks are fine; the engine caches them in your browser's storage after the first load.</li>
+        </ul>
+      </div>
+
+      <div class="panel">
+        <h2>Cheat codes explained</h2>
+        <p class="muted small">The Cheats tab understands the two code types Pokémon cheat lists use:</p>
+        <div class="code-example">
+          <div><span class="chip gs">GameShark / Action Replay</span><pre>82025840 0044
+7881A409 E2026E0C</pre><p class="tiny muted">Two groups of 8 hex digits per line.</p></div>
+          <div><span class="chip cb">CodeBreaker</span><pre>82005274 0044
+B505DB41 6E39EA4E</pre><p class="tiny muted">8 + 4 hex digits (some CB codes are 16 digits — both work).</p></div>
+        </div>
+        <h3 class="panel-title">Pokémon item IDs <span class="tiny muted">(for 0xXXX item cheats)</span></h3>
+        <div class="id-grid">
+          <span><i>0001</i> Master Ball</span><span><i>0002</i> Ultra Ball</span>
+          <span><i>0003</i> Great Ball</span><span><i>0004</i> Poké Ball</span>
+          <span><i>0044</i> Rare Candy</span><span><i>0045</i> PP Up</span>
+          <span><i>0047</i> PP Max</span><span><i>004C</i> X Defend</span>
+          <span><i>004E</i> X Accuracy</span><span><i>0053</i> Max Revive</span>
+          <span><i>0055</i> Full Restore</span><span><i>00B3</i> Nest Ball</span>
+          <span><i>00C7</i> Amulet Coin</span><span><i>00D5</i> Exp. Share</span>
+        </div>
+        <p class="tiny muted">Item cheats that change the PokéMart replace the first item sold — buy it for $0, then switch the cheat off.</p>
+        <h3 class="panel-title">House rules</h3>
+        <ul class="tips">
+          <li>Turn walking-through-walls cheats <b>off before saving</b> — you can save yourself inside a wall.</li>
+          <li>Two cheats that write the same address fight each other. Enable one at a time.</li>
+          <li>If a code does nothing, enable the game's <i>Master Code</i> first.</li>
+        </ul>
+      </div>
+
+      <div class="panel">
+        <h2>Saves, states &amp; backups</h2>
+        <div class="kv">
+          <div><b>Save states</b><p>5 slots per game + unlimited file exports (<code>.state</code>). Captures RAM exactly, including cheat effects. Load one from the Saves tab or drop a <code>.state</code> file in.</p></div>
+          <div><b>Battery saves</b><p>The game's own save file (<code>.sav</code>). Auto-synced to your PC, restored on launch, portable to other emulators and hardware. Export it before you experiment.</p></div>
+          <div><b>Where it lives</b><p>All ROMs, saves and states stay in your browser's private storage on this PC (IndexedDB + localStorage). Clearing site data wipes them — export anything precious.</p></div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <h2>About &amp; legal</h2>
+        <p class="muted small">PixelGBA is a front-end built on <b>EmulatorJS 4.2.3</b> driving the <b>mGBA</b> core (both MIT/GPL open source). The engine and core are bundled locally, so it works offline after download. No ROMs, BIOS files or copyrighted content are included or downloaded.</p>
+        <p class="muted small">Only play ROMs of games you legally own. Pokémon © Nintendo / Creatures Inc. / GAME FREAK inc. This app is not affiliated with Nintendo.</p>
+        <h3 class="panel-title">Something not working?</h3>
+        <p class="muted small">Open the <a href="check.html" style="color:#cfc8ff">self-check page</a> — it verifies every engine file this deployment needs and names the exact one that's missing.</p>
+        <div class="mini-actions">
+          <a class="btn btn-ghost btn-sm" href="check.html">Run self-check</a>
+          <button class="btn btn-ghost btn-sm" id="btnWipe" title="Remove ROMs, saves, states and settings from this browser">Clear all local data</button>
+        </div>
+      </div>
+    </div>
+  </section>
+</main>
+
+<div class="env-banner" id="envBanner" hidden>
+  <svg viewBox="0 0 24 24" class="ico"><path d="M12 3 2.5 20h19L12 3Z" stroke="currentColor" stroke-width="1.6" fill="none" stroke-linejoin="round"/><path d="M12 9.5v4.2" stroke="currentColor" stroke-width="1.6"/><circle cx="12" cy="16.8" r="1" fill="currentColor"/></svg>
+  <div>
+    <span id="envBannerBody"><b>Preview mode.</b> This page is embedded in a sandboxed frame, so the emulator's engine files are blocked here.</span>
+  </div>
+  <button class="env-close" id="envClose" aria-label="Dismiss">×</button>
+</div>
+<div class="toasts" id="toasts" aria-live="polite"></div>
+
+<!-- Engine + data + app -->
+<script src="js/cheats-db.js"></script>
+<script src="js/app.js"></script>
+</body>
+</html>
