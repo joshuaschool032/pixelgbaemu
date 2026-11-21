@@ -128,6 +128,7 @@ The mGBA archive metadata points to the `EmulatorJS/mgba` fork and the core buil
 - **Black screen:** run `check.html`, try an uncompressed `.gba`, and verify WebGL is enabled.
 - **State import rejected:** validated states must match the ROM hash and exact compatible core build. Legacy raw states are attempted by the core. Free one of the five slots before importing.
 - **Browser storage was evicted or you are moving devices:** restore a full `.pgbackup` exported from the Help tab.
+- **A cheat still appears to have an effect after switching it off:** PixelGBA resets and rebuilds the core cheat table immediately. Continuous patches stop, but items, money, flags, or progress already written into game memory/save data are not reversible; restore an earlier `.sav`, state, or full backup if needed.
 - **An update is available:** finish saving, then choose **Update and reload**. The waiting worker never replaces runtime assets in the middle of a session.
 
 ## License

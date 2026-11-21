@@ -133,6 +133,63 @@ test("custom cheat validation honors the selected type", (t) => {
   assert.match(api.validateCode("1234567Z 1234", "cb"), /Only hex digits/);
 });
 
+test("live cheat disable and removal rebuild the core table", (t) => {
+  const dom = createApp();
+  t.after(() => dom.window.close());
+  const api = dom.window.PixelGBA;
+  const calls = [];
+  const emu = {
+    cheats: [],
+    gameManager: {
+      resetCheat() { calls.push(["reset"]); },
+      setCheat(index, enabled, code) { calls.push(["set", index, enabled, code]); },
+    },
+    cheatChanged(enabled, code, index) { this.gameManager.setCheat(index, enabled, code); },
+    saveSettings() { calls.push(["save"]); },
+  };
+  dom.window.EJS_emulator = emu;
+  api.state.current = { gid: "cheat-game", name: "test.gba", header: { gameCode: "BPEE", revision: 0 } };
+  api.state.running = true;
+  const code = "82005274 0044";
+
+  api.toggleCheat("Rare Candy", code, true, { type: "cb" });
+  assert.equal(emu.cheats.length, 1);
+  assert.equal(emu.cheats[0].checked, true);
+  assert.ok(calls.some((call) => call[0] === "set" && call[2] === true));
+
+  api.toggleCheat("Rare Candy", code, false, { type: "cb" });
+  assert.equal(emu.cheats[0].checked, false);
+  const lastReset = calls.map((call) => call[0]).lastIndexOf("reset");
+  assert.equal(calls.slice(lastReset + 1).some((call) => call[0] === "set"), false);
+
+  dom.window.document.querySelector("#activeList .ac-del").click();
+  assert.equal(emu.cheats.length, 0);
+  assert.equal(api.getCheatList().length, 0);
+
+  api.toggleCheat("Rare Candy", code, true, { type: "cb" });
+  api.toggleCheat("Master Ball", "82005274 0001", true, { type: "cb" });
+  dom.window.document.querySelector("#btnClearCheats").click();
+  assert.equal(emu.cheats.length, 0);
+  assert.equal(api.getCheatList().length, 0);
+});
+
+test("an enabled legacy preset can be switched off but not enabled again", (t) => {
+  const dom = createApp();
+  t.after(() => dom.window.close());
+  const api = dom.window.PixelGBA;
+  api.state.current = { gid: "legacy-cheat-game", name: "emerald.gba", header: { gameCode: "BPEE", revision: 0 } };
+  api.toggleCheat("Legacy money", "82025BCC 0001\n82025BC4 E0FF\n82025BC6 05F5", true, { type: "cb" });
+
+  let input = dom.window.document.querySelectorAll("#presetList input")[2];
+  assert.equal(input.checked, true);
+  assert.equal(input.disabled, false);
+  input.click();
+  assert.equal(api.getCheatList()[0].checked, false);
+  input = dom.window.document.querySelectorAll("#presetList input")[2];
+  assert.equal(input.checked, false);
+  assert.equal(input.disabled, true);
+});
+
 test("library renders every ROM and uses semantic controls", (t) => {
   const dom = createApp();
   t.after(() => dom.window.close());

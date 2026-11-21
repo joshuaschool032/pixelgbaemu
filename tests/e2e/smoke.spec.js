@@ -37,6 +37,27 @@ test("app loads, boots a legal fixture, restores a save, and tears down cleanly"
   expect(workerRequested).toBe(true);
   await expect.poll(() => page.evaluate(() => Boolean(window.EJS_emulator?.gamepad))).toBe(true);
 
+  // Reproduce the user-facing live disable/remove path against the real core.
+  await page.evaluate(() => {
+    const manager = window.EJS_emulator.gameManager;
+    const reset = manager.resetCheat.bind(manager);
+    window.__pixelgbaCheatResets = 0;
+    manager.resetCheat = (...args) => { window.__pixelgbaCheatResets++; return reset(...args); };
+  });
+  await page.locator("#tab-cheats").click();
+  await page.locator("details.custom-cheat summary").click();
+  await page.locator("#ccName").fill("Smoke-test cheat");
+  await page.locator("#ccType").selectOption("cb");
+  await page.locator("#ccCode").fill("82005274 0044");
+  await page.locator("#customCheatForm button[type=submit]").click();
+  await expect(page.locator("#activeList input")).toBeChecked();
+  await page.locator("#activeList label.switch").click();
+  await expect(page.locator("#activeList input")).not.toBeChecked();
+  expect(await page.evaluate(() => window.__pixelgbaCheatResets)).toBeGreaterThanOrEqual(2);
+  await page.locator("#activeList .ac-del").click();
+  await expect(page.locator("#activeList .active-cheat")).toHaveCount(0);
+  expect(await page.evaluate(() => window.EJS_emulator.cheats.some((cheat) => /82005274/.test(cheat.code)))).toBe(false);
+
   await page.locator("#savInput").setInputFiles({
     name: "arena-smoke.sav",
     mimeType: "application/octet-stream",

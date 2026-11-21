@@ -1598,9 +1598,38 @@
     return emu.cheats.findIndex((c) => normalizeCode(c.code) === norm);
   }
 
+  /** Reset the core's indexed cheat table, then re-add only enabled entries.
+      Rebuilding is necessary because some libretro cores do not reliably remove
+      an indexed cheat when only setCheat(index, false, code) is called. */
+  function rebuildEngineCheats(emu = emulator()) {
+    if (!emu) return false;
+    if (!Array.isArray(emu.cheats)) emu.cheats = [];
+    try {
+      if (emu.gameManager?.resetCheat) {
+        emu.gameManager.resetCheat();
+        for (let index = 0; index < emu.cheats.length; index++) {
+          const cheat = emu.cheats[index];
+          if (!cheat.checked) continue;
+          if (typeof emu.cheatChanged === "function") emu.cheatChanged(true, cheat.code, index);
+          else emu.gameManager.setCheat(index, true, cheat.code);
+        }
+      } else {
+        for (let index = 0; index < emu.cheats.length; index++) {
+          const cheat = emu.cheats[index];
+          if (typeof emu.cheatChanged === "function") emu.cheatChanged(!!cheat.checked, cheat.code, index);
+        }
+      }
+      if (typeof emu.saveSettings === "function") emu.saveSettings();
+      return true;
+    } catch (error) {
+      console.warn("Could not rebuild the core cheat table", error);
+      return false;
+    }
+  }
+
   function engineAddCheat(desc, code, on) {
     const emu = emulator();
-    if (!emu) return;
+    if (!emu) return false;
     if (!Array.isArray(emu.cheats)) emu.cheats = [];
     let idx = findEngineCheat(code);
     if (idx === -1) {
@@ -1608,21 +1637,25 @@
       idx = emu.cheats.length - 1;
     }
     emu.cheats[idx].desc = desc;
+    emu.cheats[idx].code = normalizeCode(code);
     emu.cheats[idx].checked = !!on;
-    try { emu.cheatChanged(!!on, emu.cheats[idx].code, idx); } catch (e) { console.warn(e); }
-    try { emu.saveSettings && emu.saveSettings(); } catch (e) {}
-    try { emu.frontend && emu.frontend.updateCheatUI && emu.frontend.updateCheatUI(); } catch (e) {}
+    return rebuildEngineCheats(emu);
   }
 
-  function engineSetCheat(code, on) {
+  function engineRemoveCheat(code) {
     const emu = emulator();
-    if (!emu) return;
+    if (!emu) return false;
     const idx = findEngineCheat(code);
-    if (idx === -1) return;
-    emu.cheats[idx].checked = !!on;
-    try { emu.cheatChanged(!!on, emu.cheats[idx].code, idx); } catch (e) {}
-    try { emu.saveSettings && emu.saveSettings(); } catch (e) {}
-    try { emu.frontend && emu.frontend.updateCheatUI && emu.frontend.updateCheatUI(); } catch (e) {}
+    if (idx !== -1) emu.cheats.splice(idx, 1);
+    return rebuildEngineCheats(emu);
+  }
+
+  function engineClearCheats(codes) {
+    const emu = emulator();
+    if (!emu) return false;
+    const removed = new Set(codes.map(normalizeCode));
+    emu.cheats = (emu.cheats || []).filter((cheat) => !removed.has(normalizeCode(cheat.code)));
+    return rebuildEngineCheats(emu);
   }
 
   function applyEnabledCheats() {
@@ -1645,8 +1678,11 @@
       if (meta.provenance) item.provenance = meta.provenance;
     }
     setCheatList(list);
-    if (S.running) engineAddCheat(item.desc, item.code, item.checked);
-    else if (S.current) toast("Saved — cheats switch on when the game starts", "info", 2600);
+    if (S.running) {
+      const updated = engineAddCheat(item.desc, item.code, item.checked);
+      if (!updated) toast("The core could not update cheats live. Stop and relaunch the game to apply this change.", "error", 6500);
+      else if (!item.checked) toast("Cheat disabled. Values already written into the game are not automatically reversed.", "info", 5000);
+    } else if (S.current) toast("Saved — cheats switch on when the game starts", "info", 2600);
     renderCheats();
     return item.checked;
   }
@@ -1655,8 +1691,11 @@
     const norm = normalizeCode(code);
     const list = getCheatList().filter((c) => normalizeCode(c.code) !== norm);
     setCheatList(list);
-    if (S.running) engineSetCheat(norm, false);
+    const removed = !S.running || engineRemoveCheat(norm);
     renderCheats();
+    toast(removed
+      ? "Cheat removed. Items, money, flags, or progress already changed are not automatically reversed."
+      : "The cheat was removed from PixelGBA, but the core could not update live. Stop and relaunch the game.", removed ? "info" : "error", 6500);
   }
 
   function cheatIsOn(code) {
@@ -1716,7 +1755,7 @@
       const on = cheatIsOn(c.code);
       const usablePreset = provenanceOk && c.verified === true;
       row.innerHTML =
-        '<label class="switch"><input type="checkbox" ' + (on ? "checked" : "") + (usablePreset ? "" : " disabled") + ' /><span></span></label>' +
+        '<label class="switch"><input type="checkbox" ' + (on ? "checked" : "") + (usablePreset || on ? "" : " disabled") + ' /><span></span></label>' +
         '<div class="pc-body"><div class="pc-name">' + esc(c.name) +
         (c.tag ? ' <span class="tag">' + esc(c.tag) + "</span>" : "") +
         (c.type ? ' <span class="tag">' + esc(c.type === "gs" ? "GameShark/AR" : c.type === "cb" ? "CodeBreaker" : "mixed") + "</span>" : "") +
@@ -1726,6 +1765,11 @@
         "</div>";
       const cb = $("input", row);
       cb.addEventListener("change", () => {
+        if (!usablePreset && cb.checked) {
+          cb.checked = false;
+          toast("This legacy entry cannot be enabled until its complete code has a pinned source", "warn", 5000);
+          return;
+        }
         toggleCheat(c.name, c.code, cb.checked, { tag: c.tag, type: c.type, provenance: game.provenance?.url || "" });
       });
       plist.appendChild(row);
@@ -1793,10 +1837,13 @@
     toast("Re-applied enabled cheats", "success");
   });
   $("#btnClearCheats").addEventListener("click", () => {
+    const codes = getCheatList().map((cheat) => cheat.code);
     setCheatList([]);
-    for (const c of (emulator()?.cheats || [])) engineSetCheat(c.code, false);
+    const cleared = !S.running || engineClearCheats(codes);
     renderCheats();
-    toast("Cheat list cleared", "info");
+    toast(cleared
+      ? "Cheat list cleared. Values already written into the game are not automatically reversed."
+      : "The list was cleared, but the core could not update live. Stop and relaunch the game.", cleared ? "info" : "error", 6500);
   });
 
   /* ========================================================================

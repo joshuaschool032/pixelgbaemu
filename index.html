@@ -184,7 +184,7 @@
           <h2>Cheats</h2>
           <span class="badge" id="cheatGameBadge">no game loaded</span>
         </div>
-        <p class="muted small">Codes are applied live by the mGBA core — toggle them on and the effect lands in-game (usually after opening a menu or buying at a PokéMart). Everything is stored per game.</p>
+        <p class="muted small">Codes are applied live by the mGBA core. Switching one off rebuilds the core cheat table immediately; removing it also deletes it from this game's list. Values already written into the save—such as items, money, badges, or progress—cannot be automatically undone.</p>
 
         <div class="preset-picker" id="presetGames"></div>
         <div class="preset-note" id="presetNote"></div>
@@ -229,7 +229,7 @@
           <button type="button" class="btn btn-ghost btn-sm" id="btnReapply">Re-apply enabled</button>
           <button type="button" class="btn btn-ghost btn-sm" id="btnClearCheats">Remove all</button>
         </div>
-        <p class="tiny muted">Some cheats must be turned off before saving. Save states remember the cheat state, battery saves don't.</p>
+        <p class="tiny muted">Turn cheats off before saving. If a one-time effect already changed inventory, money, flags, or progress, restore an earlier save or backup to undo that game data.</p>
       </div>
     </div>
   </section>
@@ -324,7 +324,7 @@ B505DB41 6E39EA4E</pre><p class="tiny muted">8 + 4 hex digits (some CB codes are
           <span><i>0055</i> Full Restore</span><span><i>00B3</i> Nest Ball</span>
           <span><i>00C7</i> Amulet Coin</span><span><i>00D5</i> Exp. Share</span>
         </div>
-        <p class="tiny muted">Item cheats that change the PokéMart replace the first item sold — buy it for $0, then switch the cheat off.</p>
+        <p class="tiny muted">Item cheats that change the PokéMart replace the first item sold. Buy it at the displayed price, then switch the cheat off.</p>
         <h3 class="panel-title">House rules</h3>
         <ul class="tips">
           <li>Turn walking-through-walls cheats <b>off before saving</b> — you can save yourself inside a wall.</li>
