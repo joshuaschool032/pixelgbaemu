@@ -1,44 +1,62 @@
-PixelGBA — FLAT upload (no folders!)
+PixelGBA — static deployment checklist
 
-Upload these 17 files TOGETHER, all at the repo root.
-There is nothing to nest, nothing to drag folder-by-folder.
+Upload the complete repository contents together. Runtime files remain flat at the
+site root; LICENSES/, tests/, scripts/, and .github/ may stay in their directories.
+Do not upload only the original 17-file bundle: check.html, sw.js, licensing, and
+support files are now part of the maintained deployment.
 
-    1  index.html              (~20 KB)  <- opens the app
-    2  styles.css               (29 KB)
-    3  app.js                   (49 KB)
-    4  cheats-db.js              (7 KB)
-    5  loader.js                (13 KB)
-    6  emulator.min.js         (417 KB)
-    7  emulator.min.css         (25 KB)
-    8  version.json            (126 B)
-    9  en-US.json               (10 KB)
-   10  mgba.json               (118 B)
-   11  mgba-wasm.data         (1.01 MB)  <- the emulator core
-   12  mgba-legacy-wasm.data  (1.01 MB)  <- fallback core
-   13  extract7z.js           (274 KB)
-   14  extractzip.js          (192 KB)
-   15  libunrar.js             (65 KB)
-   16  libunrar.wasm          (170 KB)
-   17  serve.bat              (3 KB)     (local play only; optional on GitHub)
+REQUIRED RUNTIME FILES
+  index.html              app shell
+  styles.css              app styles
+  app.js                  app logic
+  config.js               flat runtime path map
+  pixelgba-worker.js      cancellable ROM/backup worker
+  manifest.webmanifest    installable-app metadata
+  assets/                 generated 180/192/512 px app icons
+  cheats-db.js            revision-scoped cheat presets and provenance
+  loader.js               patched EmulatorJS loader
+  emulator.min.js         EmulatorJS runtime
+  emulator.min.css        EmulatorJS styles
+  version.json            runtime version metadata
+  en-US.json              runtime localization
+  mgba.json               core build metadata
+  mgba-wasm.data          primary mGBA core
+  mgba-legacy-wasm.data   fallback mGBA core
+  extract7z.js            archive worker
+  extractzip.js           archive worker
+  libunrar.js             archive worker
+  libunrar.wasm           archive worker WASM
+  sw.js                    versioned offline cache
+  build-info.js            generated cache ID and asset manifest
+  check.html               deployment self-check
+  LICENSE                 project/EmulatorJS GPL-3.0 text
+  THIRD_PARTY_NOTICES.md  component notices and source links
+  SECURITY.md             deployment header guidance
+  docs/                   device matrix and cheat provenance
+  LICENSES/               additional license texts
 
-STEPS
-  1. github.com -> + -> New repository -> name it -> Create
-  2. Add file -> Upload files -> select ALL 17 (Ctrl+A) -> drag in -> Commit
-  3. Settings -> Pages -> Source: Deploy from a branch
-     Branch: main   Folder: / (root)   -> Save
-  4. Wait ~1 minute, then open:  https://<your-username>.github.io/<repo>/
-  5. Drop in a .gba ROM and play.
+GITHUB PAGES
+  1. In Settings -> Pages, select GitHub Actions as the source.
+  2. Merge to main or run the Deploy GitHub Pages workflow manually.
+  3. The workflow tests, assembles, and deploys the exact .pages artifact.
+  4. Its verify job checks every deployed asset and content-derived build ID.
+  5. Open https://<username>.github.io/<repository>/check.html.
+  6. Continue only when every runtime file passes.
 
-VERIFY (10 seconds)
-  The repo's file list should show index.html AND mgba-wasm.data AND
-  emulator.min.js as flat files - no subfolders at all.
-  Opening the Pages URL and pressing F12 -> Console should show no red errors.
+LOCAL USE
+  Windows: double-click serve.bat
+  macOS/Linux: run ./serve.sh
+  Node.js: node serve.js 8080
 
-WHY THIS WORKS WITHOUT FOLDERS
-  index.html carries a tiny path-map (PIXELGBA_FLAT_PATHS) that tells the
-  emulator where each engine file is, so everything can sit side by side.
-  Tested end-to-end: boots in ~6.7 s, saves, cheats, 25/25 automated checks,
-  zero console errors.
+Then open http://127.0.0.1:8080/. Do not open index.html through file://.
+The local launchers bind only to the loopback interface.
 
-PLAY LOCALLY INSTEAD (no GitHub)
-  Double-click serve.bat -> browser opens http://localhost:8080
+DEVELOPER VERIFICATION
+  npm ci
+  npm run build:icons  (required after changing the icon generator)
+  npm run build:meta   (required after changing any cached runtime asset)
+  npm run test:all
+  npm run build:pages
+
+See README.md for storage behavior, browser support, dependency updates,
+troubleshooting, tests, and licensing details.

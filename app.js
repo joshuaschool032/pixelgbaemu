@@ -1,6 +1,6 @@
 /* ==========================================================================
    PixelGBA — app logic
-   Wraps EmulatorJS 4.2.3 (mGBA core, shipped locally in ./emulatorjs) and adds:
+   Wraps EmulatorJS 4.2.3 (mGBA core, shipped as pinned flat-file assets) and adds:
      • ROM library (IndexedDB-backed, offline)
      • Save states in 5 slots per game, with screenshots
      • Battery (.sav) auto-sync + import/export
@@ -17,7 +17,8 @@
     if (!n && n !== 0) return "—";
     if (n < 1024) return n + " B";
     if (n < 1048576) return (n / 1024).toFixed(1) + " KB";
-    return (n / 1048576).toFixed(2) + " MB";
+    if (n < 1073741824) return (n / 1048576).toFixed(2) + " MB";
+    return (n / 1073741824).toFixed(2) + " GB";
   };
   const fmtWhen = (t) => {
     if (!t) return "—";
@@ -30,9 +31,301 @@
       " " + d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
   };
   const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
-  const baseName = (name) => String(name).replace(/\.(gba|agb|bin|zip|7z|rom)$/i, "");
+  const baseName = (name) => String(name).replace(/\.(gba|agb|bin|zip|7z|rar|rom)$/i, "");
   const PRESETS = window.PIXELGBA_PRESETS;
-  const gidOf = (filename) => PRESETS.slug(filename);
+  const legacyGidOf = (filename) => PRESETS.slug(filename);
+
+  /**
+   * A fast whole-buffer fingerprint used for frequent battery-save comparisons.
+   * Four independent 32-bit accumulators make accidental collisions vanishingly
+   * unlikely while still avoiding an async digest every eight seconds.
+   */
+  function bytesSig(bytes) {
+    if (!bytes) return "0";
+    const u8 = bytes instanceof Uint8Array
+      ? bytes
+      : new Uint8Array(bytes.buffer || bytes, bytes.byteOffset || 0, bytes.byteLength || undefined);
+    let a = 0x811c9dc5, b = 0x9e3779b9, c = 0x85ebca6b, d = 0xc2b2ae35;
+    for (let i = 0; i < u8.length; i++) {
+      const value = u8[i];
+      a = Math.imul(a ^ value, 0x01000193);
+      b = Math.imul(b ^ (value + i), 0x85ebca6b);
+      c = Math.imul(c + value, 0xc2b2ae35) ^ (c >>> 13);
+      d = Math.imul(d ^ value, 0x27d4eb2d) + i;
+    }
+    return [a, b, c, d].map((n) => (n >>> 0).toString(16).padStart(8, "0")).join("") + ":" + u8.length;
+  }
+
+  const hex = (buffer) => Array.from(new Uint8Array(buffer.buffer || buffer, buffer.byteOffset || 0, buffer.byteLength || undefined), (b) => b.toString(16).padStart(2, "0")).join("");
+  const asBytes = (value) => value instanceof Uint8Array
+    ? value
+    : new Uint8Array(value.buffer || value, value.byteOffset || 0, value.byteLength || undefined);
+  const ownBuffer = (value) => {
+    const bytes = asBytes(value);
+    return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+  };
+  const textDecoder = new TextDecoder();
+  const textEncoder = new TextEncoder();
+  let activeOperation = null;
+
+  function beginOperation(label, { cancelable = true } = {}) {
+    if (activeOperation) activeOperation.abort();
+    const controller = new AbortController();
+    activeOperation = controller;
+    $("#operationLabel").textContent = label;
+    $("#operationProgress").removeAttribute("value");
+    $("#btnCancelOperation").hidden = !cancelable;
+    $("#operationBanner").hidden = false;
+    return controller;
+  }
+  function updateOperation(value, label = null) {
+    const doc = window.document;
+    if (!doc) return;
+    const labelElement = doc.querySelector("#operationLabel");
+    const progress = doc.querySelector("#operationProgress");
+    if (!progress) return;
+    if (label && labelElement) labelElement.textContent = label;
+    if (Number.isFinite(value)) progress.value = Math.max(0, Math.min(100, value));
+    else progress.removeAttribute("value");
+  }
+  function finishOperation(controller) {
+    if (controller && activeOperation !== controller) return;
+    const banner = window.document && window.document.querySelector("#operationBanner");
+    if (banner) banner.hidden = true;
+    activeOperation = null;
+  }
+  $("#btnCancelOperation").addEventListener("click", () => activeOperation && activeOperation.abort());
+
+  function runDataWorker(type, payload, { signal, onProgress, transfers = [] } = {}) {
+    if (typeof Worker === "undefined") return Promise.reject(new Error("Workers unavailable"));
+    return new Promise((resolve, reject) => {
+      const worker = new Worker(new URL("pixelgba-worker.js", location.href));
+      const id = Math.random().toString(36).slice(2);
+      const cleanup = () => { worker.terminate(); signal?.removeEventListener("abort", abort); };
+      const abort = () => { cleanup(); reject(new DOMException("Operation cancelled", "AbortError")); };
+      if (signal?.aborted) { abort(); return; }
+      signal?.addEventListener("abort", abort, { once: true });
+      worker.onerror = (event) => { cleanup(); reject(new Error(event.message || "Background worker failed")); };
+      worker.onmessage = (event) => {
+        if (!event.data || event.data.id !== id) return;
+        if ("progress" in event.data) { onProgress?.(event.data.progress, event.data.label); return; }
+        cleanup();
+        if (event.data.error) reject(new Error(event.data.error));
+        else resolve(event.data.result);
+      };
+      worker.postMessage({ id, type, payload }, transfers);
+    });
+  }
+
+  async function readFileWithProgress(file, signal, onProgress) {
+    if (!file.stream || !file.size) {
+      const buffer = await file.arrayBuffer();
+      if (signal?.aborted) throw new DOMException("Operation cancelled", "AbortError");
+      return buffer;
+    }
+    const reader = file.stream().getReader();
+    const chunks = []; let total = 0;
+    const abort = () => reader.cancel().catch(() => {});
+    if (signal?.aborted) throw new DOMException("Operation cancelled", "AbortError");
+    signal?.addEventListener("abort", abort, { once: true });
+    try {
+      for (;;) {
+        if (signal?.aborted) throw new DOMException("Operation cancelled", "AbortError");
+        const { done, value } = await reader.read();
+        if (done) break;
+        chunks.push(value); total += value.byteLength;
+        onProgress?.(Math.min(20, total / file.size * 20), "Reading " + file.name + "…");
+      }
+    } finally {
+      signal?.removeEventListener("abort", abort);
+    }
+    if (signal?.aborted) throw new DOMException("Operation cancelled", "AbortError");
+    const output = new Uint8Array(total); let offset = 0;
+    for (const chunk of chunks) { output.set(chunk, offset); offset += chunk.byteLength; }
+    return output.buffer;
+  }
+
+  async function digestHex(value) {
+    const bytes = asBytes(value);
+    try {
+      if (!window.crypto || !window.crypto.subtle) throw new Error("SubtleCrypto unavailable");
+      return hex(await window.crypto.subtle.digest("SHA-256", ownBuffer(bytes)));
+    } catch (error) {
+      return "fp-" + bytesSig(bytes).replace(":", "-");
+    }
+  }
+
+  async function contentId(value) {
+    const digest = await digestHex(value);
+    return digest.startsWith("fp-") ? digest : "sha256-" + digest;
+  }
+
+  const engineGameName = (filename, gid) => {
+    const clean = baseName(filename).replace(/[^a-z0-9._ -]+/gi, "_").trim().slice(0, 80) || "game";
+    return clean + "-" + gid + ".gba";
+  };
+
+  function parseGbaHeader(value) {
+    const bytes = asBytes(value);
+    if (bytes.length < 0xbe) return null;
+    const ascii = (start, length) => textDecoder.decode(bytes.slice(start, start + length)).replace(/[\0\xff]+/g, "").trim();
+    const gameCode = ascii(0xac, 4).toUpperCase();
+    if (!/^[A-Z0-9]{4}$/.test(gameCode)) return null;
+    return {
+      title: ascii(0xa0, 12),
+      gameCode,
+      makerCode: ascii(0xb0, 2).toUpperCase(),
+      revision: bytes[0xbc],
+    };
+  }
+
+  let runtimeBundlePromise = null;
+  function ensureRuntimeBundle() {
+    if (window.EJS_COMPRESSION) return Promise.resolve();
+    if (runtimeBundlePromise) return runtimeBundlePromise;
+    runtimeBundlePromise = new Promise((resolve, reject) => {
+      const script = document.createElement("script");
+      script.src = (window.PIXELGBA_FLAT_PATHS && window.PIXELGBA_FLAT_PATHS["emulator.min.js"]) || "emulator.min.js";
+      script.dataset.pgbaRuntime = "1";
+      script.onload = resolve;
+      script.onerror = () => reject(new Error("Could not load the archive extractor runtime"));
+      document.head.appendChild(script);
+    }).catch((error) => { runtimeBundlePromise = null; throw error; });
+    return runtimeBundlePromise;
+  }
+
+  async function extractWithBundledRuntime(bytes, onProgress = null, signal = null) {
+    await ensureRuntimeBundle();
+    const bridge = {
+      downloadFile: async (path, _progress, _cors, options = {}) => {
+        const filename = String(path).split("/").pop();
+        const mapped = (window.PIXELGBA_FLAT_PATHS && window.PIXELGBA_FLAT_PATHS[filename]) || filename;
+        const response = await fetch(new URL(mapped, location.href));
+        if (!response.ok) return -1;
+        return { data: options.responseType === "text" ? await response.text() : await response.arrayBuffer() };
+      },
+      startGameError(message) { throw new Error(message || "Archive extraction failed"); },
+    };
+    return new window.EJS_COMPRESSION(bridge).decompress(bytes, (suffix) => {
+      if (signal?.aborted) throw new DOMException("Operation cancelled", "AbortError");
+      const percent = Number.parseInt(String(suffix).replace(/\D/g, ""), 10);
+      onProgress?.(Number.isFinite(percent) ? 30 + percent * 0.35 : null, "Extracting ROM…");
+    });
+  }
+
+  async function extractZip(bytes) {
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    let eocd = -1;
+    for (let i = bytes.length - 22; i >= Math.max(0, bytes.length - 65_557); i--) {
+      if (view.getUint32(i, true) === 0x06054b50) { eocd = i; break; }
+    }
+    if (eocd < 0) throw new Error("ZIP directory was not found");
+    const count = view.getUint16(eocd + 10, true);
+    let offset = view.getUint32(eocd + 16, true);
+    const candidates = [];
+    for (let index = 0; index < count; index++) {
+      if (view.getUint32(offset, true) !== 0x02014b50) throw new Error("Invalid ZIP directory");
+      const method = view.getUint16(offset + 10, true);
+      const compressedSize = view.getUint32(offset + 20, true);
+      const size = view.getUint32(offset + 24, true);
+      const nameLength = view.getUint16(offset + 28, true);
+      const extraLength = view.getUint16(offset + 30, true);
+      const commentLength = view.getUint16(offset + 32, true);
+      const localOffset = view.getUint32(offset + 42, true);
+      const name = textDecoder.decode(bytes.slice(offset + 46, offset + 46 + nameLength));
+      if (/\.(gba|agb|bin|rom)$/i.test(name) && !name.endsWith("/")) {
+        candidates.push({ name, method, compressedSize, size, localOffset });
+      }
+      offset += 46 + nameLength + extraLength + commentLength;
+    }
+    if (!candidates.length) throw new Error("The archive contains no GBA ROM");
+    candidates.sort((a, b) => b.size - a.size || a.name.localeCompare(b.name));
+    const entry = candidates[0];
+    if (view.getUint32(entry.localOffset, true) !== 0x04034b50) throw new Error("Invalid ZIP entry");
+    const localNameLength = view.getUint16(entry.localOffset + 26, true);
+    const localExtraLength = view.getUint16(entry.localOffset + 28, true);
+    const start = entry.localOffset + 30 + localNameLength + localExtraLength;
+    const compressed = bytes.slice(start, start + entry.compressedSize);
+    let data;
+    if (entry.method === 0) data = compressed;
+    else if (entry.method === 8 && typeof DecompressionStream !== "undefined") {
+      const stream = new Blob([compressed]).stream().pipeThrough(new DecompressionStream("deflate-raw"));
+      data = new Uint8Array(await new Response(stream).arrayBuffer());
+    } else {
+      throw new Error("ZIP compression requires the bundled extractor");
+    }
+    if (entry.size && data.length !== entry.size) throw new Error("ZIP entry size mismatch");
+    return { name: entry.name, data };
+  }
+
+  async function extractArchiveRom(rawBytes, filename, onProgress = null, signal = null) {
+    const isZip = rawBytes[0] === 0x50 && rawBytes[1] === 0x4b;
+    if (isZip) {
+      try { return await extractZip(rawBytes); } catch (error) {
+        console.warn("Native ZIP extraction failed; using bundled extractor", error);
+      }
+    }
+    if (!isZip && !/\.(7z|rar)$/i.test(filename)) return { name: filename, data: rawBytes };
+    const files = await extractWithBundledRuntime(rawBytes, onProgress, signal);
+    const candidates = Object.entries(files || {})
+      .filter(([name, data]) => /\.(gba|agb|bin|rom)$/i.test(name) && data && asBytes(data).length)
+      .map(([name, data]) => ({ name, data: asBytes(data) }))
+      .sort((a, b) => b.data.length - a.data.length || a.name.localeCompare(b.name));
+    if (!candidates.length) throw new Error("The archive contains no GBA ROM");
+    return candidates[0];
+  }
+
+  /** Hash the extracted cartridge so raw, ZIP, 7z and RAR copies share one identity. */
+  async function identifyRom(file, { signal = null, onProgress = null } = {}) {
+    let rawBuffer = await readFileWithProgress(file, signal, onProgress);
+    let prepared = null;
+    if (typeof Worker !== "undefined") {
+      try {
+        prepared = await runDataWorker("prepareRom", { buffer: rawBuffer, filename: file.name }, {
+          signal,
+          onProgress,
+        });
+        rawBuffer = prepared.buffer;
+      } catch (error) {
+        if (error.name === "AbortError") throw error;
+        // Older browsers may not support the dedicated worker. Continue on the
+        // main thread rather than making ROM loading unavailable.
+        console.warn("ROM worker unavailable; falling back to the main thread", error);
+      }
+    }
+
+    let romBytes, gid, rawGid, extractedName;
+    if (prepared && !prepared.fallback) {
+      romBytes = new Uint8Array(prepared.buffer);
+      gid = prepared.gid;
+      rawGid = prepared.rawGid;
+      extractedName = prepared.name;
+    } else {
+      const rawBytes = new Uint8Array(rawBuffer);
+      onProgress?.(30, "Inspecting archive…");
+      const extracted = await extractArchiveRom(rawBytes, file.name, onProgress, signal);
+      if (signal?.aborted) throw new DOMException("Operation cancelled", "AbortError");
+      romBytes = asBytes(extracted.data);
+      onProgress?.(70, "Identifying cartridge…");
+      gid = await contentId(romBytes);
+      rawGid = romBytes === rawBytes ? gid : await contentId(rawBytes);
+      extractedName = extracted.name;
+    }
+    const romName = String(extractedName || file.name).split(/[\\/]/).pop() || "game.gba";
+    const legacyGids = [...new Set([legacyGidOf(file.name), legacyGidOf(romName), rawGid])].filter((id) => id && id !== gid);
+    onProgress?.(100, "ROM ready");
+    return {
+      gid,
+      legacyGid: legacyGids[0] || null,
+      legacyGids,
+      buffer: ownBuffer(romBytes),
+      name: romName,
+      sourceName: file.name,
+      header: parseGbaHeader(romBytes),
+      archived: romName !== file.name || rawGid !== gid,
+    };
+  }
+
 
   /* EmulatorJS asks for a screen wake lock; embedded/preview contexts deny it.
      Swallow the rejection so it doesn't surface as an unhandled error. */
@@ -59,18 +352,29 @@
       states: { name: "PixelGBA-states", store: "states" },
     };
     const cache = {};
+    const DB_VERSION = 2;
     function open(kind) {
       const spec = DBS[kind];
       if (cache[kind]) return cache[kind];
+      if (!window.indexedDB) return Promise.reject(new Error("IndexedDB unavailable"));
       cache[kind] = new Promise((resolve, reject) => {
-        if (!window.indexedDB) return reject(new Error("IndexedDB unavailable"));
-        const req = indexedDB.open(spec.name, 1);
+        const req = indexedDB.open(spec.name, DB_VERSION);
         req.onupgradeneeded = () => {
           const db = req.result;
           if (!db.objectStoreNames.contains(spec.store)) db.createObjectStore(spec.store);
         };
-        req.onsuccess = () => resolve(req.result);
-        req.onerror = () => reject(req.error);
+        req.onsuccess = () => {
+          req.result.onversionchange = () => req.result.close();
+          resolve(req.result);
+        };
+        req.onerror = () => {
+          delete cache[kind];
+          reject(req.error || new Error("Could not open IndexedDB"));
+        };
+        req.onblocked = () => {
+          delete cache[kind];
+          reject(new Error("IndexedDB upgrade was blocked by another tab"));
+        };
       });
       return cache[kind];
     }
@@ -80,11 +384,13 @@
         const t = db.transaction([DBS[kind].store], mode);
         const store = t.objectStore(DBS[kind].store);
         let out;
-        const r = fn(store);
+        let r;
+        try { r = fn(store); } catch (error) { reject(error); return; }
         if (r) r.onsuccess = () => (out = r.result);
+        if (r) r.onerror = () => reject(r.error || new Error("IndexedDB request failed"));
         t.oncomplete = () => resolve(out);
-        t.onerror = () => reject(t.error);
-        t.onabort = () => reject(t.error);
+        t.onerror = () => reject(t.error || new Error("IndexedDB transaction failed"));
+        t.onabort = () => reject(t.error || new Error("IndexedDB transaction aborted"));
       });
     }
     return {
@@ -93,10 +399,19 @@
       del: (kind, key) => tx(kind, "readwrite", (s) => s.delete(key)),
       clear: async (kind) => {
         try { await tx(kind, "readwrite", (s) => s.clear()); } catch (e) { console.warn(e); }
-        try { indexedDB.deleteDatabase(DBS[kind].name); } catch (e) {}
+        try { const db = await cache[kind]; db && db.close(); } catch (e) {}
         delete cache[kind];
       },
       keys: (kind) => tx(kind, "readonly", (s) => s.getAllKeys()),
+      entries: async (kind) => {
+        const keys = await tx(kind, "readonly", (s) => s.getAllKeys());
+        const values = await Promise.all(keys.map((key) => tx(kind, "readonly", (s) => s.get(key))));
+        return keys.map((key, index) => [key, values[index]]);
+      },
+      deletePrefix: async (kind, prefix) => {
+        const keys = await tx(kind, "readonly", (s) => s.getAllKeys());
+        await Promise.all(keys.filter((key) => String(key).startsWith(prefix)).map((key) => tx(kind, "readwrite", (s) => s.delete(key))));
+      },
     };
   })();
 
@@ -137,7 +452,8 @@
     if (usable) {
       return {
         get(k, d) { try { const v = window.localStorage.getItem(k); return v ? JSON.parse(v) : d; } catch (e) { return d; } },
-        set(k, v) { try { window.localStorage.setItem(k, JSON.stringify(v)); } catch (e) {} },
+        set(k, v) { try { window.localStorage.setItem(k, JSON.stringify(v)); return true; } catch (e) { return false; } },
+        setRaw(k, v) { try { window.localStorage.setItem(k, String(v)); return true; } catch (e) { return false; } },
         del(k) { try { window.localStorage.removeItem(k); } catch (e) {} },
         raw: (k) => { try { return window.localStorage.getItem(k); } catch (e) { return null; } },
         allKeys: () => { try { return Object.keys(window.localStorage); } catch (e) { return []; } },
@@ -146,7 +462,8 @@
     }
     return {
       get(k, d) { return k in mem ? mem[k] : d; },
-      set(k, v) { mem[k] = v; },
+      set(k, v) { mem[k] = v; return true; },
+      setRaw(k, v) { try { mem[k] = JSON.parse(v); } catch (e) { mem[k] = v; } return true; },
       del(k) { delete mem[k]; },
       raw: (k) => (k in mem ? JSON.stringify(mem[k]) : null),
       allKeys: () => Object.keys(mem),
@@ -159,6 +476,12 @@
   const K_CHEATS = (gid) => "pgba.cheats." + gid;
   const K_LASTPRESET = "pgba.lastPreset";
   const K_LASTROM = "pgba.lastRom";
+  const K_LIBRARY_SORT = "pgba.librarySort";
+  const K_LAST_BACKUP = "pgba.lastBackup";
+  const STATE_MAGIC = "PIXELGBA_STATE_V1\n";
+  const BACKUP_FORMAT = "pixelgba-backup-v1";
+  const CORE_ID = "mgba";
+  const EMULATOR_VERSION = "4.2.3";
 
   /* -------------------------------------------------------------- app state */
   const S = {
@@ -174,7 +497,28 @@
     lastSaveSig: null,
     savedSave: null,
     savedSaveAt: 0,
+    launchId: 0,
+    bootTimer: null,
+    storageWarned: false,
+    libraryQuery: "",
+    librarySort: store.get(K_LIBRARY_SORT, "recent"),
+    favoritesOnly: false,
+    saveSyncQueue: Promise.resolve(),
+    saveEventHandler: null,
+    diagnostics: [],
+    installPrompt: null,
   };
+
+  if (!Array.isArray(S.roms)) S.roms = [];
+
+  function persist(key, value, label = "settings") {
+    const ok = store.set(key, value);
+    if (!ok && !S.storageWarned) {
+      S.storageWarned = true;
+      toast("Could not persist " + label + " — browser storage may be full or blocked", "warn", 6500);
+    }
+    return ok;
+  }
 
   /* FLAT BUILD: all engine files live next to index.html (no subfolders),
      so dataPath is the page itself and EJS_paths maps the usual names. */
@@ -185,12 +529,33 @@
   };
 
   /* ------------------------------------------------------------- view tabs */
-  $$(".tab").forEach((tab) => {
-    tab.addEventListener("click", () => {
-      $$(".tab").forEach((t) => t.classList.toggle("is-active", t === tab));
-      $$(".view").forEach((v) => v.classList.toggle("is-active", v.id === "view-" + tab.dataset.view));
-      if (tab.dataset.view === "saves") renderSaves();
-      if (tab.dataset.view === "cheats") renderCheats();
+  const tabs = $$(".tab");
+  function activateTab(tab, { focus = false } = {}) {
+    tabs.forEach((item) => {
+      const active = item === tab;
+      item.classList.toggle("is-active", active);
+      item.setAttribute("aria-selected", String(active));
+      item.tabIndex = active ? 0 : -1;
+    });
+    $$(".view").forEach((view) => {
+      const active = view.id === "view-" + tab.dataset.view;
+      view.classList.toggle("is-active", active);
+      view.hidden = !active;
+    });
+    if (focus) tab.focus();
+    if (tab.dataset.view === "saves") renderSaves();
+    if (tab.dataset.view === "cheats") renderCheats();
+    if (tab.dataset.view === "help") refreshStorageHealth();
+  }
+  tabs.forEach((tab, index) => {
+    tab.addEventListener("click", () => activateTab(tab));
+    tab.addEventListener("keydown", (event) => {
+      let next = null;
+      if (event.key === "ArrowRight") next = tabs[(index + 1) % tabs.length];
+      else if (event.key === "ArrowLeft") next = tabs[(index - 1 + tabs.length) % tabs.length];
+      else if (event.key === "Home") next = tabs[0];
+      else if (event.key === "End") next = tabs[tabs.length - 1];
+      if (next) { event.preventDefault(); activateTab(next, { focus: true }); }
     });
   });
 
@@ -207,66 +572,233 @@
     hide() { $("#bootScreen").classList.add("is-hidden"); },
   };
 
+  async function migrateLegacyIdentity(identity, filename) {
+    const newGid = identity.gid;
+    const oldGids = [...new Set(identity.legacyGids || [identity.legacyGid])]
+      .filter((gid) => gid && gid !== newGid);
+    if (!oldGids.length) return;
+
+    const moveRecord = async (kind, from, to) => {
+      const oldValue = await IDB.get(kind, from).catch(() => null);
+      if (!oldValue) return;
+      const existing = await IDB.get(kind, to).catch(() => null);
+      if (!existing) await IDB.put(kind, to, oldValue);
+      await IDB.del(kind, from).catch(() => {});
+    };
+
+    for (const oldGid of oldGids) {
+      await moveRecord("saves", oldGid, newGid);
+      await moveRecord("saves", "__rom__" + oldGid, "__rom__" + newGid);
+      const stateKeys = await IDB.keys("states").catch(() => []);
+      for (const key of stateKeys.filter((key) => String(key).startsWith(oldGid + ":"))) {
+        await moveRecord("states", key, newGid + String(key).slice(oldGid.length));
+      }
+
+      const oldCheats = store.raw(K_CHEATS(oldGid));
+      if (oldCheats && !store.raw(K_CHEATS(newGid))) store.setRaw(K_CHEATS(newGid), oldCheats);
+      if (oldCheats) store.del(K_CHEATS(oldGid));
+
+      // EmulatorJS includes EJS_gameID in its per-game settings key. Preserve
+      // controls/settings from filename/archive-keyed versions on first load.
+      const oldEnginePrefix = "ejs-pgba-" + oldGid + "-";
+      for (const key of store.allKeys().filter((key) => key.startsWith(oldEnginePrefix))) {
+        const suffix = key.slice(oldEnginePrefix.length);
+        const core = suffix.split("-")[0] || "gba";
+        const target = "ejs-pgba-" + newGid + "-" + core + "-" + engineGameName(identity.name || filename, newGid) + "-settings";
+        if (!store.raw(target)) store.setRaw(target, store.raw(key));
+        store.del(key);
+      }
+    }
+
+    const oldSet = new Set(oldGids);
+    S.roms = S.roms
+      .map((rom) => oldSet.has(rom.gid) ? { ...rom, gid: newGid, name: identity.name || rom.name, header: identity.header || rom.header } : rom)
+      .filter((rom, index, all) => all.findIndex((candidate) => candidate.gid === rom.gid) === index);
+    persist(K_ROMS, S.roms, "the ROM library");
+
+    const last = store.get(K_LASTROM, null);
+    if (last && oldSet.has(last.gid)) persist(K_LASTROM, { ...last, gid: newGid, name: identity.name || last.name, header: identity.header || last.header }, "the last played game");
+  }
+
+  function seedPresetCheats(gid, presetId) {
+    if (!gid || !presetId || store.raw(K_CHEATS(gid))) return;
+    const preset = store.raw(K_CHEATS("preset:" + presetId));
+    if (preset) store.setRaw(K_CHEATS(gid), preset);
+  }
+
   /* ========================================================================
      LIBRARY — ROM list rendered from localStorage metadata
      ===================================================================== */
   function renderLibrary() {
-    S.roms.sort((a, b) => (b.lastPlayed || 0) - (a.lastPlayed || 0));
+    const query = S.libraryQuery.trim().toLowerCase();
+    const filtered = S.roms.filter((rom) => {
+      const haystack = [rom.name, rom.header && rom.header.title, rom.header && rom.header.gameCode].filter(Boolean).join(" ").toLowerCase();
+      return (!query || haystack.includes(query)) && (!S.favoritesOnly || rom.favorite);
+    });
+    const sorted = filtered.slice().sort((a, b) => {
+      if (S.librarySort === "title") return baseName(a.name).localeCompare(baseName(b.name), undefined, { sensitivity: "base" });
+      if (S.librarySort === "added") return (b.addedAt || b.lastPlayed || 0) - (a.addedAt || a.lastPlayed || 0);
+      return (b.lastPlayed || 0) - (a.lastPlayed || 0);
+    });
     const list = $("#recentList");
-    $("#romCount").textContent = String(S.roms.length);
+    $("#romCount").textContent = sorted.length === S.roms.length ? String(S.roms.length) : sorted.length + "/" + S.roms.length;
     list.innerHTML = "";
-    for (const rom of S.roms.slice(0, 8)) {
+    if (!sorted.length) {
+      list.innerHTML = '<div class="empty-state">' + (S.roms.length ? "No games match this filter." : "Your locally cached games appear here.") + "</div>";
+      return;
+    }
+    for (const rom of sorted) {
       const row = document.createElement("div");
       row.className = "recent-item";
-      row.title = "Play " + rom.name;
+      const headerMeta = rom.header && rom.header.gameCode
+        ? " · " + esc(rom.header.gameCode) + " rev " + Number(rom.header.revision || 0)
+        : "";
       row.innerHTML =
-        '<span class="r-ico">GBA</span>' +
-        '<div style="min-width:0"><div class="r-name">' + esc(baseName(rom.name)) + "</div>" +
-        '<div class="r-meta">' + fmtBytes(rom.size) + " · " + fmtWhen(rom.lastPlayed) + "</div></div>" +
-        '<button class="r-del" title="Remove from list">×</button>';
-      row.addEventListener("click", async (e) => {
-        if (e.target.closest(".r-del")) {
-          S.roms = S.roms.filter((r) => r.gid !== rom.gid);
-          store.set(K_ROMS, S.roms);
-          await IDB.del("saves", rom.gid).catch(() => {});
-          renderLibrary(); renderSaves(); renderCheats();
-          toast("Removed " + baseName(rom.name) + " and its saved data", "warn");
-          return;
-        }
-        await launchStoredRom(rom);
+        '<button type="button" class="r-favorite" aria-pressed="' + String(!!rom.favorite) + '" aria-label="' + (rom.favorite ? "Remove " : "Add ") + esc(baseName(rom.name)) + ' ' + (rom.favorite ? "from favorites" : "to favorites") + '" title="Favorite">' + (rom.favorite ? "★" : "☆") + "</button>" +
+        '<button type="button" class="r-play" title="Play ' + esc(rom.name) + '">' +
+        '<span class="r-ico" aria-hidden="true">GBA</span>' +
+        '<span class="r-copy"><span class="r-name">' + esc(baseName(rom.name)) + "</span>" +
+        '<span class="r-meta">' + fmtBytes(rom.size) + " · " + fmtWhen(rom.lastPlayed) + headerMeta +
+        (rom.cached === false ? " · file not cached" : "") + "</span></span></button>" +
+        '<button type="button" class="r-del" aria-label="Remove ' + esc(baseName(rom.name)) + ' from library" title="Remove from library; saves are kept">×</button>' +
+        '<button type="button" class="r-purge" aria-label="Delete ' + esc(baseName(rom.name)) + ' and all local data" title="Delete game and all local data">🗑</button>';
+      $(".r-favorite", row).addEventListener("click", () => {
+        rom.favorite = !rom.favorite;
+        persist(K_ROMS, S.roms, "the ROM library");
+        renderLibrary();
       });
+      $(".r-play", row).addEventListener("click", () => launchStoredRom(rom));
+      $(".r-del", row).addEventListener("click", async () => {
+        S.roms = S.roms.filter((r) => r.gid !== rom.gid);
+        persist(K_ROMS, S.roms, "the ROM library");
+        await IDB.del("saves", "__rom__" + rom.gid).catch(() => {});
+        renderLibrary();
+        toast("Removed " + baseName(rom.name) + " from the library; saves and states were kept", "info", 5000);
+      });
+      $(".r-purge", row).addEventListener("click", () => deleteGameData(rom));
       list.appendChild(row);
     }
   }
 
   async function launchStoredRom(rom) {
     // ROM blobs are cached in IndexedDB so the library can relaunch without re-picking the file.
-    let file = await IDB.get("saves", "__rom__" + rom.gid).catch(() => null);
-    if (!file) {
+    const cached = await IDB.get("saves", "__rom__" + rom.gid).catch(() => null);
+    if (!cached || !cached.data) {
       toast("That ROM isn't cached anymore — pick the file again from your PC", "warn", 5200);
       $("#romInput").click();
       return;
     }
-    const blob = new Blob([file.data], { type: "application/octet-stream" });
-    startGame(new File([blob], rom.name, { lastModified: rom.lastPlayed || Date.now() }));
+    const blob = new Blob([cached.data], { type: "application/octet-stream" });
+    await startGame(new File([blob], rom.name, { lastModified: rom.lastPlayed || Date.now() }));
   }
 
-  async function rememberRom(file) {
-    const gid = gidOf(file.name);
-    const rec = { name: file.name, gid, size: file.size, lastPlayed: Date.now() };
-    S.roms = S.roms.filter((r) => r.gid !== gid);
-    S.roms.unshift(rec);
-    store.set(K_ROMS, S.roms);
+  async function rememberRom(file, identity) {
+    const previous = S.roms.find((rom) => rom.gid === identity.gid);
+    const rec = {
+      name: identity.name || file.name,
+      sourceName: identity.sourceName || file.name,
+      gid: identity.gid,
+      size: identity.buffer.byteLength,
+      lastPlayed: Date.now(),
+      addedAt: previous?.addedAt || Date.now(),
+      favorite: !!previous?.favorite,
+      header: identity.header || null,
+      cached: true,
+    };
     try {
-      const buf = await file.arrayBuffer();
-      await IDB.put("saves", "__rom__" + gid, { data: buf, name: file.name, at: Date.now() });
-    } catch (e) {
-      console.warn("Could not cache ROM blob", e);
+      await IDB.put("saves", "__rom__" + identity.gid, { data: identity.buffer, name: rec.name, sourceName: rec.sourceName, header: rec.header, at: Date.now() });
+    } catch (error) {
+      rec.cached = false;
+      console.warn("Could not cache ROM blob", error);
+      toast("The game can run, but it could not be cached for Play again — browser storage may be full", "warn", 6500);
     }
+    S.roms = S.roms.filter((rom) => rom.gid !== identity.gid && rom.gid !== identity.legacyGid);
+    S.roms.unshift(rec);
+    persist(K_ROMS, S.roms, "the ROM library");
     return rec;
   }
 
+  async function deleteEngineSaveRecords(paths) {
+    const wanted = new Set(paths.filter(Boolean));
+    if (!wanted.size || !window.indexedDB) return;
+    let names = ["EM_FS_" + location.pathname];
+    try {
+      if (indexedDB.databases) names = (await indexedDB.databases()).map((db) => db.name).filter((name) => name && name.startsWith("EM_FS_"));
+    } catch (error) {}
+    await Promise.all(names.map((name) => new Promise((resolve) => {
+      const req = indexedDB.open(name);
+      req.onerror = () => resolve();
+      req.onsuccess = () => {
+        const db = req.result;
+        if (!db.objectStoreNames.contains("FILE_DATA")) { db.close(); resolve(); return; }
+        const tx = db.transaction("FILE_DATA", "readwrite");
+        const objectStore = tx.objectStore("FILE_DATA");
+        for (const path of wanted) objectStore.delete(path);
+        tx.oncomplete = tx.onerror = tx.onabort = () => { db.close(); resolve(); };
+      };
+    })));
+  }
+
+  async function deleteOwnedEngineFilesystem() {
+    if (!window.indexedDB) return;
+    const directory = location.pathname.endsWith("/") ? location.pathname : location.pathname.replace(/[^/]*$/, "");
+    const ownedNames = new Set(["EM_FS_" + location.pathname, "EM_FS_" + directory]);
+    let names = [...ownedNames];
+    try {
+      if (indexedDB.databases) names = (await indexedDB.databases()).map((db) => db.name).filter((name) => ownedNames.has(name));
+    } catch (error) {}
+    await Promise.all(names.filter(Boolean).map((name) => new Promise((resolve) => {
+      const request = indexedDB.deleteDatabase(name);
+      request.onsuccess = request.onerror = request.onblocked = () => resolve();
+    })));
+  }
+
+  function deleteEngineSettings(gid) {
+    store.allKeys().filter((key) => key.startsWith("ejs-pgba-" + gid + "-")).forEach((key) => store.del(key));
+  }
+
+  async function deleteGameData(rom) {
+    if (!confirm("Delete " + baseName(rom.name) + " and all of its cached ROM data, battery saves, states, cheats and settings? This cannot be undone.")) return;
+    const save = await IDB.get("saves", rom.gid).catch(() => null);
+    let livePath = null;
+    if (S.current && S.current.gid === rom.gid) {
+      livePath = saveFilePath();
+      await stopGame({ silent: true });
+    }
+    await IDB.del("saves", rom.gid).catch(() => {});
+    await IDB.del("saves", "__rom__" + rom.gid).catch(() => {});
+    await IDB.deletePrefix("states", rom.gid + ":").catch(() => {});
+    await deleteEngineSaveRecords([livePath, save && save.enginePath]);
+    store.del(K_CHEATS(rom.gid));
+    deleteEngineSettings(rom.gid);
+    S.roms = S.roms.filter((item) => item.gid !== rom.gid);
+    persist(K_ROMS, S.roms, "the ROM library");
+    if (S.current && S.current.gid === rom.gid) {
+      S.current = null;
+      const last = store.get(K_LASTROM, null);
+      if (last && last.gid === rom.gid) store.del(K_LASTROM);
+    }
+    renderLibrary(); renderSaves(); renderCheats(); renderBootHint();
+    toast("Deleted " + baseName(rom.name) + " and all of its local data", "warn", 5200);
+  }
+
   /* ---- input wiring ---- */
+  $("#librarySearch").addEventListener("input", (event) => {
+    S.libraryQuery = event.target.value;
+    renderLibrary();
+  });
+  $("#librarySort").value = ["recent", "title", "added"].includes(S.librarySort) ? S.librarySort : "recent";
+  $("#librarySort").addEventListener("change", (event) => {
+    S.librarySort = event.target.value;
+    persist(K_LIBRARY_SORT, S.librarySort, "the library sort order");
+    renderLibrary();
+  });
+  $("#libraryFavorites").addEventListener("click", (event) => {
+    S.favoritesOnly = !S.favoritesOnly;
+    event.currentTarget.setAttribute("aria-pressed", String(S.favoritesOnly));
+    event.currentTarget.classList.toggle("is-active", S.favoritesOnly);
+    renderLibrary();
+  });
   $("#romInput").addEventListener("change", (e) => {
     const f = e.target.files && e.target.files[0];
     e.target.value = "";
@@ -297,6 +829,12 @@
     }
   }
   $("#dropZone").addEventListener("click", () => $("#romInput").click());
+  $("#dropZone").addEventListener("keydown", (event) => {
+    if (event.key === "Enter" || event.key === " ") {
+      event.preventDefault();
+      $("#romInput").click();
+    }
+  });
 
   ["dragenter", "dragover"].forEach((ev) =>
     window.addEventListener(ev, (e) => {
@@ -315,8 +853,8 @@
     const f = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
     if (!f) return;
     e.preventDefault();
-    if (!/\.(gba|agb|bin|zip|7z)$/i.test(f.name)) {
-      toast("That's not a GBA ROM — expected .gba / .agb / .bin / .zip", "error");
+    if (!/\.(gba|agb|bin|zip|7z|rar)$/i.test(f.name)) {
+      toast("That's not a GBA ROM — expected .gba / .agb / .bin / .zip / .7z / .rar", "error");
       return;
     }
     startGame(f);
@@ -326,77 +864,114 @@
      EMULATOR LIFECYCLE
      ===================================================================== */
   /**
-   * Run the EmulatorJS loader. Its bootstrap is an IIFE that must re-run for every
-   * new session (it's what creates window.EJS_emulator), but the engine bundle it
-   * injects declares globals/classes that can only be evaluated once. So: re-run the
-   * loader, and short-circuit re-appending an already-loaded emulator.min.js.
+   * Run the EmulatorJS loader. Its bootstrap must re-run for every session; the
+   * patched loader reuses the already-evaluated engine bundle and stylesheet.
    */
   function runLoader() {
     return new Promise((resolve, reject) => {
-      document.querySelectorAll("script[data-pgba-loader]").forEach((s) => s.remove());
-      const head = document.head;
-      const nativeAppend = head.appendChild.bind(head);
-      const alreadyLoaded = !!window.EmulatorJS;
-      if (alreadyLoaded) {
-        head.appendChild = function (el) {
-          if (el && el.tagName === "SCRIPT" && /emulator\.min\.js/.test(el.src || "")) {
-            setTimeout(() => el.onload && el.onload(), 0);   // satisfy the loader's promise
-            return el;                                        // ...without re-evaluating it
-          }
-          return nativeAppend(el);
-        };
-      }
-      const restore = () => { head.appendChild = nativeAppend; };
-      const s = document.createElement("script");
-      s.src = ENGINE.loader;
-      s.dataset.pgbaLoader = "1";
-      s.onload = () => { restore(); resolve(); };
-      s.onerror = () => { restore(); reject(new Error("Could not load engine script")); };
-      nativeAppend(s);
+      document.querySelectorAll("script[data-pgba-loader]").forEach((script) => script.remove());
+      const script = document.createElement("script");
+      script.src = ENGINE.loader;
+      script.dataset.pgbaLoader = "1";
+      script.onload = resolve;
+      script.onerror = () => reject(new Error("Could not load engine script"));
+      document.head.appendChild(script);
     });
   }
 
   function emulator() { return window.EJS_emulator || null; }
   function gameManager() { const e = emulator(); return e && e.gameManager ? e.gameManager : null; }
+  function disposeStaleEmulator(emu) {
+    if (!emu) return;
+    try { emu.gamepad && emu.gamepad.terminate && emu.gamepad.terminate(); } catch (e) {}
+    try { emu.callEvent && emu.callEvent("exit"); } catch (e) {}
+    try { emu.pgbaDisposeListeners && emu.pgbaDisposeListeners(); } catch (e) {}
+  }
 
   async function startGame(file) {
     if (S.starting) { toast("A game is already booting…", "warn"); return; }
     if (IS_FILE) {
       showEnvBanner("file");
-      toast("Can't run from file:// — double-click serve.bat (Windows) or ./serve.sh, then open http://localhost:8080", "error", 9000);
+      toast("Can't run from file:// — double-click serve.bat (Windows) or run ./serve.sh, then open http://localhost:8080", "error", 9000);
       return;
     }
-    const ok = /\.(gba|agb|bin|zip|7z)$/i.test(file.name || "");
+    const ok = /\.(gba|agb|bin|zip|7z|rar)$/i.test(file.name || "");
     if (!ok) { toast("Please choose a .gba ROM file", "error"); return; }
 
     S.starting = true;
-    await stopGame({ silent: true, keepOverlay: true });
+    const launchId = ++S.launchId;
+    const operation = beginOperation("Reading " + file.name + "…");
+    let identity;
+    try {
+      pill("Reading game…", true);
+      identity = await identifyRom(file, {
+        signal: operation.signal,
+        onProgress: (value, label) => updateOperation(value, label),
+      });
+      if (launchId !== S.launchId) return;
+    } catch (error) {
+      S.starting = false;
+      if (error.name === "AbortError") {
+        pill("Engine ready · offline", false);
+        toast("ROM loading cancelled", "info");
+      } else {
+        pill("Could not read game", false);
+        toast(error.message || "Could not read that ROM file", "error");
+      }
+      return;
+    } finally {
+      finishOperation(operation);
+    }
 
-    S.current = { name: file.name, gid: gidOf(file.name), size: file.size, lastPlayed: Date.now() };
+    await stopGame({ silent: true, keepOverlay: true, preserveLaunch: true });
+    if (launchId !== S.launchId) return;
+    S.starting = true;
+    await migrateLegacyIdentity(identity, file.name).catch((error) => console.warn("Legacy storage migration failed", error));
+    const romFile = new File([identity.buffer], identity.name || file.name, {
+      type: "application/octet-stream",
+      lastModified: file.lastModified || Date.now(),
+    });
+
+    S.current = {
+      name: romFile.name,
+      sourceName: file.name,
+      gid: identity.gid,
+      size: identity.buffer.byteLength,
+      lastPlayed: Date.now(),
+      header: identity.header || null,
+    };
     S.lastSaveSig = null;
     S.savedSave = null;
     S.savedSaveAt = 0;
-    store.set(K_LASTROM, S.current);
+    persist(K_LASTROM, S.current, "the last played game");
 
-    // preselect the matching Pokémon preset
-    const match = PRESETS.match(file.name);
-    if (match) { S.presetId = match.id; store.set(K_LASTPRESET, match.id); }
+    // Preselect the matching Pokémon preset and carry over cheats configured
+    // before the ROM was loaded.
+    const match = PRESETS.match(romFile.name, identity.header);
+    if (match) {
+      S.presetId = match.id;
+      persist(K_LASTPRESET, match.id, "the selected cheat preset");
+      seedPresetCheats(identity.gid, match.id);
+    }
 
-    rememberRom(file).catch(() => {});
+    rememberRom(file, identity).then(renderLibrary).catch((error) => console.warn(error));
     renderLibrary();
 
     boot.hide();
     pill("Loading engine…", true);
-    $("#toolbarHint").textContent = "Booting " + baseName(file.name) + "…";
+    $("#toolbarHint").textContent = "Booting " + baseName(romFile.name) + "…";
     renderSaves(); renderCheats();
 
     /* --- EmulatorJS globals (read by loader.js) --- */
     window.EJS_player = "#game";
     window.EJS_core = "mgba";
     window.EJS_pathtodata = ENGINE.dataPath;
-    window.EJS_gameUrl = file;
-    window.EJS_gameName = file.name;
-    window.EJS_gameID = "pgba-" + S.current.gid;
+    window.EJS_gameUrl = romFile;
+    // The core derives its IDBFS save path from gameName. Include the content ID so
+    // same-named revisions cannot collide in EmulatorJS's own filesystem either.
+    window.EJS_gameName = engineGameName(romFile.name, S.current.gid);
+    const expectedGameId = "pgba-" + S.current.gid;
+    window.EJS_gameID = expectedGameId;
     window.EJS_biosUrl = "";
     window.EJS_language = "en-US";
     window.EJS_disableAutoLang = true;
@@ -438,48 +1013,68 @@
     window.EJS_ready = () => {
       try {
         const emu = emulator();
+        if (launchId !== S.launchId || !emu || !emu.config || emu.config.gameId !== expectedGameId) {
+          disposeStaleEmulator(emu);
+          return;
+        }
         // pause-time save sync
         const origToggle = emu.togglePlaying.bind(emu);
         emu.togglePlaying = (dontUpdate) => {
           origToggle(dontUpdate);
           if (emu.paused) syncSaveNow().catch(() => {});
         };
+        // EmulatorJS emits this whenever the core flushes SRAM. Polling remains a
+        // fallback, while this hook persists normal in-game saves immediately.
+        S.saveEventHandler = (bytes) => {
+          if (!S.saveFlushInProgress) syncSaveNow({ fromEvent: true, bytes }).catch(() => {});
+        };
+        emu.on && emu.on("saveSaveFiles", S.saveEventHandler);
         // theme the emulator menu bar to match PixelGBA
         emu.setColor && emu.setColor("#8b7bff");
       } catch (e) { console.warn(e); }
     };
 
     window.EJS_onGameStart = () => {
+      const emu = emulator();
+      if (launchId !== S.launchId || !emu || !emu.config || emu.config.gameId !== expectedGameId) {
+        disposeStaleEmulator(emu);
+        return;
+      }
+      if (S.bootTimer) clearTimeout(S.bootTimer);
+      S.bootTimer = null;
       S.running = true;
       S.starting = false;
       boot.hide();
-      pill("Playing · " + baseName(file.name), false);
-      $("#toolbarHint").textContent = baseName(file.name) + " · " + fmtBytes(file.size);
+      pill("Playing · " + baseName(romFile.name), false);
+      $("#toolbarHint").textContent = baseName(romFile.name) + " · " + fmtBytes(identity.buffer.byteLength);
       restoreBatterySave().then(() => {
-        applyEnabledCheats();
+        if (launchId === S.launchId) applyEnabledCheats();
       });
       startSavePoll();
       renderLibrary(); renderSaves(); renderCheats(); renderBootHint();
-      toast("Loaded " + baseName(file.name), "success");
+      toast("Loaded " + baseName(romFile.name), "success");
     };
 
     try {
       await runLoader();
+      if (launchId !== S.launchId) return;
       S.engineLoaded = true;
     } catch (e) {
+      if (launchId !== S.launchId) return;
       S.starting = false;
       boot.show();
       pill("Engine failed to load", false);
-      toast("Could not load the local emulator engine. Check that the emulatorjs/ folder is present.", "error", 7000);
+      toast("Could not load the bundled emulator engine. Run the self-check to find a missing asset.", "error", 7000);
       return;
     }
 
     if (IS_FILE) showEnvBanner("file");
     else if (IS_FRAMED) showEnvBanner("preview");
 
-    // watchdog: if the core never starts, surface a hint instead of a silent black screen
-    setTimeout(() => {
-      if (S.starting && !S.running) {
+    // Watchdog: if the core never starts, surface a hint instead of a silent black screen.
+    if (S.bootTimer) clearTimeout(S.bootTimer);
+    S.bootTimer = setTimeout(() => {
+      if (launchId === S.launchId && S.starting && !S.running) {
         S.starting = false;
         boot.show();
         pill("Failed to start", false);
@@ -489,26 +1084,40 @@
             ? "Opened from file:// — run serve.bat (Windows) or ./serve.sh, then use http://localhost:8080"
             : "Embedded previews block the emulator's engine files. Open the address in a normal browser tab.", "warn", 9000);
         } else {
-          toast("The core didn't start. Try unzipping the ROM, or reload the page.", "error", 7000);
+          toast("The core didn't start. Try unzipping the ROM, or run the self-check.", "error", 7000);
         }
       }
     }, IS_FRAMED ? 12000 : 30000);
   }
 
-  async function stopGame({ silent = false, keepOverlay = false } = {}) {
+  async function stopGame({ silent = false, keepOverlay = false, preserveLaunch = false } = {}) {
+    if (!preserveLaunch) S.launchId++;
+    if (S.bootTimer) clearTimeout(S.bootTimer);
+    S.bootTimer = null;
     stopSavePoll();
     const emu = emulator();
+    const shouldExit = !!(emu && emu.started && emu.gameManager);
     if (emu) {
-      try { await syncSaveNow(); } catch (e) {}
+      try { await syncSaveNow({ force: true }); } catch (e) {}
       try { emu.setVolume(0); } catch (e) {}
       try { emu.pause(true); } catch (e) {}
-      try { emu.gameManager.toggleMainLoop(0); } catch (e) {}
+      try { emu.gamepad && emu.gamepad.terminate && emu.gamepad.terminate(); } catch (e) {}
+      try { if (S.saveEventHandler && emu.off) emu.off("saveSaveFiles", S.saveEventHandler); } catch (e) {}
+      S.saveEventHandler = null;
+      try {
+        if (shouldExit && emu.callEvent) emu.callEvent("exit");
+        else if (emu.gameManager) emu.gameManager.toggleMainLoop(0);
+        if (emu.pgbaDisposeListeners) emu.pgbaDisposeListeners();
+      } catch (e) { console.warn("Engine teardown failed", e); }
+      // EmulatorJS aborts and unmounts its WASM filesystem one second after exit.
+      if (shouldExit) await sleep(1050);
+      try { emu.functions = {}; } catch (e) {}
     }
-    window.EJS_emulator = null;
+    if (window.EJS_emulator === emu) window.EJS_emulator = null;
     const host = $("#game");
-    if (host) host.innerHTML = "";
+    if (host) { host.innerHTML = ""; host.classList.remove("ejs_parent"); host.removeAttribute("tabindex"); }
     S.running = false;
-    S.starting = false;
+    if (!preserveLaunch) S.starting = false;
     if (!keepOverlay) {
       boot.show();
       renderBootHint();
@@ -635,15 +1244,6 @@
     return { blob, thumb };
   }
 
-  async function dataURLtoBlob(url) {
-    const [head, b64] = url.split(",");
-    const mime = (head.match(/data:([^;]+)/) || [])[1] || "image/png";
-    const bin = atob(b64);
-    const u8 = new Uint8Array(bin.length);
-    for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
-    return new Blob([u8], { type: mime });
-  }
-
   /* ========================================================================
      BATTERY SAVE (.sav) — auto sync in/out
      ===================================================================== */
@@ -653,39 +1253,78 @@
     try { return gm.getSaveFilePath(); } catch (e) { return null; }
   }
 
-  function bytesSig(u8) {
-    if (!u8) return "0";
-    let h = u8.length;
-    const n = Math.min(u8.length, 64);
-    for (let i = 0; i < n; i++) h = (h * 31 + u8[i]) | 0;
-    return h + ":" + u8.length;
-  }
-
-  async function syncSaveNow({ force = false } = {}) {
+  async function performSaveSync({ force = false, fromEvent = false, bytes: suppliedBytes = null } = {}) {
     const gm = gameManager();
-    if (!gm || !S.running || !S.current) return;
-    let bytes;
-    try { bytes = gm.getSaveFile(); } catch (e) { return; }
+    const current = S.current;
+    if (!gm || !S.running || !current) return;
+    let bytes = suppliedBytes ? asBytes(suppliedBytes) : null;
+    try {
+      if (!fromEvent) {
+        S.saveFlushInProgress = true;
+        gm.saveSaveFiles && gm.saveSaveFiles();
+      }
+      if (!bytes || !bytes.length) bytes = gm.getSaveFile(false);
+    } catch (e) {
+      return;
+    } finally {
+      S.saveFlushInProgress = false;
+    }
     if (!bytes || !bytes.length) return;
     const sig = bytesSig(bytes);
     if (!force && sig === S.lastSaveSig) return;
     const copy = bytes.slice(); // detach from WASM heap
-    S.lastSaveSig = sig;
-    S.savedSave = copy;
-    S.savedSaveAt = Date.now();
+    const savedAt = Date.now();
+    let enginePath = null;
+    try { enginePath = gm.getSaveFilePath(); } catch (e) {}
     try {
-      await IDB.put("saves", S.current.gid, { data: copy.buffer, at: S.savedSaveAt, name: S.current.name });
-      renderSavPanel();
+      const previous = await IDB.get("saves", current.gid).catch(() => null);
+      const previousSig = previous && previous.data ? (previous.sig || bytesSig(new Uint8Array(previous.data))) : null;
+      if (sig === previousSig) {
+        if (S.current && S.current.gid === current.gid) {
+          S.lastSaveSig = sig;
+          S.savedSave = copy;
+          S.savedSaveAt = previous.at || savedAt;
+          renderSavPanel();
+        }
+        return;
+      }
+      const history = previous && previous.data
+        ? [{ data: previous.data, at: previous.at || savedAt, sig: previousSig }, ...(previous.history || [])].slice(0, 2)
+        : [];
+      await IDB.put("saves", current.gid, {
+        data: copy.buffer,
+        at: savedAt,
+        name: current.name,
+        enginePath,
+        sig,
+        history,
+      });
+      if (S.current && S.current.gid === current.gid) {
+        S.lastSaveSig = sig;
+        S.savedSave = copy;
+        S.savedSaveAt = savedAt;
+        renderSavPanel();
+      }
     } catch (e) {
       console.warn("save sync failed", e);
+      toast("Battery save could not be persisted — export it before closing this page", "error", 7000);
+      throw e;
     }
+  }
+
+  function syncSaveNow(options = {}) {
+    // Serialize reads/writes so a core event, poll and visibility flush cannot race
+    // and overwrite a newer save with an older snapshot.
+    S.saveSyncQueue = S.saveSyncQueue.catch(() => {}).then(() => performSaveSync(options));
+    return S.saveSyncQueue;
   }
 
   async function restoreBatterySave() {
     const gm = gameManager();
-    if (!gm || !S.current) return;
-    const rec = await IDB.get("saves", S.current.gid).catch(() => null);
-    if (!rec || !rec.data) return;
+    const current = S.current;
+    if (!gm || !current) return;
+    const rec = await IDB.get("saves", current.gid).catch(() => null);
+    if (!rec || !rec.data || gameManager() !== gm || !S.current || S.current.gid !== current.gid) return;
     try {
       const path = saveFilePath();
       if (!path) return;
@@ -723,10 +1362,13 @@
     if (S.savePoll) clearInterval(S.savePoll);
     S.savePoll = null;
   }
-  window.addEventListener("beforeunload", () => {
-    // best-effort synchronous flush of the battery save
-    if (S.running) { try { syncSaveNow({ force: true }); } catch (e) {} }
-  });
+  const finalSaveFlush = () => {
+    // Browsers do not wait for asynchronous IndexedDB work during unload. The
+    // visibility/pagehide hooks start the write as early as the platform allows.
+    if (S.running) syncSaveNow({ force: true }).catch(() => {});
+  };
+  window.addEventListener("pagehide", finalSaveFlush);
+  window.addEventListener("beforeunload", finalSaveFlush);
   document.addEventListener("visibilitychange", () => {
     if (document.hidden && S.running) syncSaveNow().catch(() => {});
   });
@@ -735,6 +1377,10 @@
      SAVE STATES
      ===================================================================== */
   const stateKey = (slot) => (S.current ? S.current.gid : null) + ":" + slot;
+  function nextFreeSlot(keys, gid, max = 5) {
+    for (let slot = 1; slot <= max; slot++) if (!keys.includes(gid + ":" + slot)) return slot;
+    return null;
+  }
 
   async function captureState(slot) {
     const emu = emulator();
@@ -751,7 +1397,11 @@
     } catch (e) {}
     const rec = {
       data: state.buffer.slice(state.byteOffset, state.byteOffset + state.byteLength),
-      thumb, at: Date.now(), size: state.byteLength, name: S.current.name,
+      thumb,
+      at: Date.now(),
+      size: state.byteLength,
+      name: S.current.name,
+      metadata: { gameId: S.current.gid, core: CORE_ID, emulatorVersion: EMULATOR_VERSION, romHeader: S.current.header || null },
     };
     try {
       await IDB.put("states", stateKey(slot), rec);
@@ -791,9 +1441,39 @@
       fr.readAsDataURL(blob);
     });
   }
-  async function dataURLToBlob(dataUrl) {
-    const res = await fetch(dataUrl);
-    return res.blob();
+  async function packStateFile(data, metadata = {}) {
+    const bytes = asBytes(data);
+    const header = {
+      format: "pixelgba-state-v1",
+      gameId: metadata.gameId,
+      romName: metadata.romName || "game.gba",
+      romHeader: metadata.romHeader || null,
+      core: CORE_ID,
+      emulatorVersion: EMULATOR_VERSION,
+      createdAt: metadata.createdAt || Date.now(),
+      byteLength: bytes.length,
+      sha256: await digestHex(bytes),
+    };
+    return new Blob([STATE_MAGIC, JSON.stringify(header), "\n", bytes], { type: "application/x-pixelgba-state" });
+  }
+
+  async function unpackStateFile(buffer) {
+    const bytes = asBytes(buffer);
+    const magic = textEncoder.encode(STATE_MAGIC);
+    const wrapped = bytes.length > magic.length && magic.every((value, index) => bytes[index] === value);
+    if (!wrapped) return { data: ownBuffer(bytes), metadata: null, wrapped: false };
+    let newline = -1;
+    for (let index = magic.length; index < Math.min(bytes.length, magic.length + 65_536); index++) {
+      if (bytes[index] === 10) { newline = index; break; }
+    }
+    if (newline < 0) throw new Error("State metadata is incomplete");
+    let metadata;
+    try { metadata = JSON.parse(textDecoder.decode(bytes.slice(magic.length, newline))); }
+    catch (error) { throw new Error("State metadata is invalid"); }
+    const data = bytes.slice(newline + 1);
+    if (metadata.format !== "pixelgba-state-v1" || metadata.byteLength !== data.length) throw new Error("State length does not match its metadata");
+    if (metadata.sha256 !== await digestHex(data)) throw new Error("State checksum does not match");
+    return { data: ownBuffer(data), metadata, wrapped: true };
   }
 
   async function exportLatestState() {
@@ -806,28 +1486,66 @@
       const rec = await IDB.get("states", k);
       if (rec && (!bestRec || rec.at > bestRec.at)) { best = k; bestRec = rec; }
     }
-    const blob = new Blob([bestRec.data], { type: "application/octet-stream" });
-    downloadBlob(blob, baseName(S.current.name) + "-slot" + String(best).split(":")[1] + ".state");
-    toast("Exported latest state", "success");
+    const blob = await packStateFile(bestRec.data, {
+      gameId: S.current.gid,
+      romName: S.current.name,
+      romHeader: S.current.header,
+      createdAt: bestRec.at,
+    });
+    downloadBlob(blob, baseName(S.current.name) + "-slot" + String(best).split(":")[1] + ".pgstate");
+    toast("Exported validated PixelGBA state", "success");
   }
 
   async function importStateFile(file) {
     if (!S.current) { toast("Load the matching game first, then import its state", "warn", 5000); return; }
     if (!S.running) { toast("Start the game first, then import a state", "warn", 5000); return; }
-    const buf = await file.arrayBuffer();
-    // pick the next free slot
+    const current = S.current;
     const keys = await IDB.keys("states").catch(() => []);
-    let free = 1;
-    while (keys.includes(S.current.gid + ":" + free) && free < 5) free++;
-    const rec = { data: buf, thumb: "", at: Date.now(), size: buf.byteLength, name: file.name };
-    await IDB.put("states", stateKey(free), rec);
-    try {
-      emulator().gameManager.loadState(new Uint8Array(buf));
-      toast("State imported into slot " + free + " and loaded", "success");
-    } catch (e) {
-      toast("State imported to slot " + free + " (could not auto-load)", "warn");
+    const free = nextFreeSlot(keys, current.gid);
+    if (free === null) {
+      toast("All five slots are occupied — delete a slot before importing", "warn", 6000);
+      return;
     }
-    renderSaves();
+    let parsed;
+    try {
+      const buf = await file.arrayBuffer();
+      if (!buf.byteLength || buf.byteLength > 64 * 1024 * 1024) throw new Error("State file size is invalid");
+      parsed = await unpackStateFile(buf);
+    } catch (error) {
+      toast(error.message || "Could not read that state file", "error", 6000);
+      return;
+    }
+    if (parsed.metadata) {
+      if (parsed.metadata.gameId !== current.gid) {
+        toast("That state belongs to a different ROM; no slot was changed", "error", 6500);
+        return;
+      }
+      if (parsed.metadata.core !== CORE_ID || parsed.metadata.emulatorVersion !== EMULATOR_VERSION) {
+        toast("That state was created by an incompatible core version; no slot was changed", "error", 6500);
+        return;
+      }
+    }
+    try {
+      emulator().gameManager.loadState(new Uint8Array(parsed.data));
+    } catch (error) {
+      toast("That state is corrupt or incompatible; no slot was changed", "error", 6000);
+      return;
+    }
+    const rec = {
+      data: parsed.data,
+      thumb: "",
+      at: Date.now(),
+      size: parsed.data.byteLength,
+      name: file.name,
+      metadata: parsed.metadata,
+    };
+    try {
+      await IDB.put("states", current.gid + ":" + free, rec);
+      toast("State imported into slot " + free + " and loaded" + (parsed.wrapped ? " (checksum verified)" : " (legacy raw state)"), "success");
+      renderSaves();
+    } catch (error) {
+      toast("The state loaded, but browser storage could not save it", "error", 6000);
+    }
   }
 
   /* ========================================================================
@@ -839,7 +1557,7 @@
     return "preset:emerald";
   }
   function getCheatList() { return store.get(K_CHEATS(cheatListKey()), []); }
-  function setCheatList(list) { store.set(K_CHEATS(cheatListKey()), list); }
+  function setCheatList(list) { persist(K_CHEATS(cheatListKey()), list, "the cheat list"); }
 
   /** Canonical form: one line per code line, "XXXXXXXX YYYYYYYY"/"XXXXXXXX YYYY", upper-case hex. */
   function normalizeCode(code) {
@@ -852,7 +1570,7 @@
   }
 
   /** Returns an error string, or null when the code is well-formed. */
-  function validateCode(code) {
+  function validateCode(code, type = null) {
     const raw = String(code).trim();
     if (!raw) return "Enter at least one line of hex code";
     const lines = raw.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
@@ -863,8 +1581,11 @@
         return "Only hex digits (0-9, A-F) are allowed — found “" + bad + "”";
       }
       const digits = line.replace(/[\s\-]/g, "");
-      if (digits.length !== 12 && digits.length !== 16) {
-        return "Each line needs 12 or 16 hex digits (GameShark 8+8, CodeBreaker 8+4) — this one has " + digits.length;
+      const valid = type === "gs" ? digits.length === 16 : type === "cb" ? (digits.length === 12 || digits.length === 16) : (digits.length === 12 || digits.length === 16);
+      if (!valid) {
+        if (type === "gs") return "Each GameShark / Action Replay line needs 16 hex digits (8+8) — this one has " + digits.length;
+        if (type === "cb") return "Each CodeBreaker line needs 12 or 16 hex digits — this one has " + digits.length;
+        return "Each line needs 12 or 16 hex digits — this one has " + digits.length;
       }
     }
     return null;
@@ -877,9 +1598,38 @@
     return emu.cheats.findIndex((c) => normalizeCode(c.code) === norm);
   }
 
+  /** Reset the core's indexed cheat table, then re-add only enabled entries.
+      Rebuilding is necessary because some libretro cores do not reliably remove
+      an indexed cheat when only setCheat(index, false, code) is called. */
+  function rebuildEngineCheats(emu = emulator()) {
+    if (!emu) return false;
+    if (!Array.isArray(emu.cheats)) emu.cheats = [];
+    try {
+      if (emu.gameManager?.resetCheat) {
+        emu.gameManager.resetCheat();
+        for (let index = 0; index < emu.cheats.length; index++) {
+          const cheat = emu.cheats[index];
+          if (!cheat.checked) continue;
+          if (typeof emu.cheatChanged === "function") emu.cheatChanged(true, cheat.code, index);
+          else emu.gameManager.setCheat(index, true, cheat.code);
+        }
+      } else {
+        for (let index = 0; index < emu.cheats.length; index++) {
+          const cheat = emu.cheats[index];
+          if (typeof emu.cheatChanged === "function") emu.cheatChanged(!!cheat.checked, cheat.code, index);
+        }
+      }
+      if (typeof emu.saveSettings === "function") emu.saveSettings();
+      return true;
+    } catch (error) {
+      console.warn("Could not rebuild the core cheat table", error);
+      return false;
+    }
+  }
+
   function engineAddCheat(desc, code, on) {
     const emu = emulator();
-    if (!emu) return;
+    if (!emu) return false;
     if (!Array.isArray(emu.cheats)) emu.cheats = [];
     let idx = findEngineCheat(code);
     if (idx === -1) {
@@ -887,21 +1637,25 @@
       idx = emu.cheats.length - 1;
     }
     emu.cheats[idx].desc = desc;
+    emu.cheats[idx].code = normalizeCode(code);
     emu.cheats[idx].checked = !!on;
-    try { emu.cheatChanged(!!on, emu.cheats[idx].code, idx); } catch (e) { console.warn(e); }
-    try { emu.saveSettings && emu.saveSettings(); } catch (e) {}
-    try { emu.frontend && emu.frontend.updateCheatUI && emu.frontend.updateCheatUI(); } catch (e) {}
+    return rebuildEngineCheats(emu);
   }
 
-  function engineSetCheat(code, on) {
+  function engineRemoveCheat(code) {
     const emu = emulator();
-    if (!emu) return;
+    if (!emu) return false;
     const idx = findEngineCheat(code);
-    if (idx === -1) return;
-    emu.cheats[idx].checked = !!on;
-    try { emu.cheatChanged(!!on, emu.cheats[idx].code, idx); } catch (e) {}
-    try { emu.saveSettings && emu.saveSettings(); } catch (e) {}
-    try { emu.frontend && emu.frontend.updateCheatUI && emu.frontend.updateCheatUI(); } catch (e) {}
+    if (idx !== -1) emu.cheats.splice(idx, 1);
+    return rebuildEngineCheats(emu);
+  }
+
+  function engineClearCheats(codes) {
+    const emu = emulator();
+    if (!emu) return false;
+    const removed = new Set(codes.map(normalizeCode));
+    emu.cheats = (emu.cheats || []).filter((cheat) => !removed.has(normalizeCode(cheat.code)));
+    return rebuildEngineCheats(emu);
   }
 
   function applyEnabledCheats() {
@@ -915,15 +1669,20 @@
     const list = getCheatList();
     let item = list.find((c) => normalizeCode(c.code) === norm);
     if (!item) {
-      item = { desc, code: norm, checked: !!on, custom: !!meta.custom, tag: meta.tag || "" };
+      item = { desc, code: norm, checked: !!on, custom: !!meta.custom, tag: meta.tag || "", type: meta.type || "", provenance: meta.provenance || "" };
       list.push(item);
     } else {
       item.checked = !!on;
       if (meta.tag) item.tag = meta.tag;
+      if (meta.type) item.type = meta.type;
+      if (meta.provenance) item.provenance = meta.provenance;
     }
     setCheatList(list);
-    if (S.running) engineAddCheat(item.desc, item.code, item.checked);
-    else if (S.current) toast("Saved — cheats switch on when the game starts", "info", 2600);
+    if (S.running) {
+      const updated = engineAddCheat(item.desc, item.code, item.checked);
+      if (!updated) toast("The core could not update cheats live. Stop and relaunch the game to apply this change.", "error", 6500);
+      else if (!item.checked) toast("Cheat disabled. Values already written into the game are not automatically reversed.", "info", 5000);
+    } else if (S.current) toast("Saved — cheats switch on when the game starts", "info", 2600);
     renderCheats();
     return item.checked;
   }
@@ -932,8 +1691,11 @@
     const norm = normalizeCode(code);
     const list = getCheatList().filter((c) => normalizeCode(c.code) !== norm);
     setCheatList(list);
-    if (S.running) engineSetCheat(norm, false);
+    const removed = !S.running || engineRemoveCheat(norm);
     renderCheats();
+    toast(removed
+      ? "Cheat removed. Items, money, flags, or progress already changed are not automatically reversed."
+      : "The cheat was removed from PixelGBA, but the core could not update live. Stop and relaunch the game.", removed ? "info" : "error", 6500);
   }
 
   function cheatIsOn(code) {
@@ -951,23 +1713,39 @@
     // preset pills
     const picker = $("#presetGames");
     picker.innerHTML = "";
-    const matched = S.current ? PRESETS.match(S.current.name) : null;
+    const matched = S.current ? PRESETS.match(S.current.name, S.current.header) : null;
     const activeId = S.presetId || (matched && matched.id) || "emerald";
     for (const g of PRESETS.games) {
       const b = document.createElement("button");
+      b.type = "button";
       b.className = "preset-game" + (g.id === activeId ? " is-active" : "");
       b.style.setProperty("--dot", g.accent);
       b.innerHTML = "<i></i>" + esc(g.title.replace("Pokémon ", ""));
       b.addEventListener("click", () => {
         S.presetId = g.id;
-        store.set(K_LASTPRESET, g.id);
+        persist(K_LASTPRESET, g.id, "the selected cheat preset");
         renderCheats();
       });
       picker.appendChild(b);
     }
 
     const game = PRESETS.games.find((g) => g.id === activeId) || PRESETS.games[0];
-    $("#presetNote").textContent = game.note || "";
+    const mismatchNote = S.current && S.current.header && !matched
+      ? "No preset exactly matches cartridge " + S.current.header.gameCode + " revision " + S.current.header.revision + ". Presets below are manual and may be incompatible. "
+      : "";
+    const provenanceOk = game.provenance?.status === "cross-referenced";
+    const cartridgeTargets = (game.headers || []).map((header) => header.gameCode + " revision " + (header.revisions || []).join("/")).join(", ");
+    const note = $("#presetNote");
+    note.textContent = mismatchNote + (provenanceOk ? "Only entries confirmed in the pinned revision-specific source can be toggled. " : "This legacy preset is disabled until a revision-specific source is independently cross-referenced. ") + (game.note || "") +
+      " Target: " + (game.region || "unknown region") + " " + (game.revisionLabel || "unknown revision") + (cartridgeTargets ? " (" + cartridgeTargets + ")" : "") + ". ";
+    if (game.provenance?.url) {
+      const source = document.createElement("a");
+      source.href = game.provenance.url;
+      source.target = "_blank";
+      source.rel = "noopener noreferrer";
+      source.textContent = "View pinned provenance source";
+      note.appendChild(source);
+    }
 
     const plist = $("#presetList");
     plist.innerHTML = "";
@@ -975,16 +1753,24 @@
       const row = document.createElement("div");
       row.className = "preset-cheat";
       const on = cheatIsOn(c.code);
+      const usablePreset = provenanceOk && c.verified === true;
       row.innerHTML =
-        '<label class="switch"><input type="checkbox" ' + (on ? "checked" : "") + ' /><span></span></label>' +
+        '<label class="switch"><input type="checkbox" ' + (on ? "checked" : "") + (usablePreset || on ? "" : " disabled") + ' /><span></span></label>' +
         '<div class="pc-body"><div class="pc-name">' + esc(c.name) +
-        (c.tag ? ' <span class="tag">' + esc(c.tag) + "</span>" : "") + "</div>" +
+        (c.tag ? ' <span class="tag">' + esc(c.tag) + "</span>" : "") +
+        (c.type ? ' <span class="tag">' + esc(c.type === "gs" ? "GameShark/AR" : c.type === "cb" ? "CodeBreaker" : "mixed") + "</span>" : "") +
+        (!usablePreset ? ' <span class="tag tag-warn">source needed</span>' : "") + "</div>" +
         '<div class="pc-code">' + esc(normalizeCode(c.code)) + "</div>" +
         (c.note ? '<div class="pc-note">' + esc(c.note) + "</div>" : "") +
         "</div>";
       const cb = $("input", row);
       cb.addEventListener("change", () => {
-        toggleCheat(c.name, c.code, cb.checked, { tag: c.tag });
+        if (!usablePreset && cb.checked) {
+          cb.checked = false;
+          toast("This legacy entry cannot be enabled until its complete code has a pinned source", "warn", 5000);
+          return;
+        }
+        toggleCheat(c.name, c.code, cb.checked, { tag: c.tag, type: c.type, provenance: game.provenance?.url || "" });
       });
       plist.appendChild(row);
     }
@@ -1004,11 +1790,12 @@
           '<label class="switch"><input type="checkbox" ' + (c.checked ? "checked" : "") + (S.running ? "" : " disabled") + ' /><span></span></label>' +
           '<div class="ac-body"><div class="ac-name">' + esc(c.desc) +
           (c.custom ? ' <span class="tag">custom</span>' : "") +
-          (c.tag ? ' <span class="tag">' + esc(c.tag) + "</span>" : "") + "</div>" +
+          (c.tag ? ' <span class="tag">' + esc(c.tag) + "</span>" : "") +
+          (c.type ? ' <span class="tag">' + esc(c.type) + "</span>" : "") + "</div>" +
           '<div class="ac-code">' + esc(normalizeCode(c.code)) + "</div></div>" +
-          '<button class="ac-del" title="Remove">×</button>';
+          '<button type="button" class="ac-del" title="Remove">×</button>';
         $("input", row).addEventListener("change", (e) => {
-          toggleCheat(c.desc, c.code, e.target.checked, { custom: c.custom, tag: c.tag });
+          toggleCheat(c.desc, c.code, e.target.checked, { custom: c.custom, tag: c.tag, type: c.type, provenance: c.provenance });
         });
         $(".ac-del", row).addEventListener("click", () => removeCheat(c.code));
         al.appendChild(row);
@@ -1019,19 +1806,26 @@
     $("#btnClearCheats").disabled = !list.length;
   }
 
+  $("#ccType").addEventListener("change", (event) => {
+    $("#ccHint").textContent = event.target.value === "gs"
+      ? "GameShark / Action Replay: exactly 8+8 hex digits per line"
+      : "CodeBreaker: 8+4 or 8+8 hex digits per line";
+  });
+
   $("#customCheatForm").addEventListener("submit", (e) => {
     e.preventDefault();
     const name = $("#ccName").value.trim();
     const code = $("#ccCode").value.trim();
+    const type = $("#ccType").value;
     if (!name) { $("#ccName").focus(); return; }
-    const err = validateCode(code);
+    const err = validateCode(code, type);
     if (err) { toast(err, "error"); $("#ccCode").focus(); return; }
     const norm = normalizeCode(code);
-    if (getCheatList().some((c) => normalizeCode(c.code) === norm && c.desc === name)) {
-      toast("That cheat is already in the list", "warn");
+    if (getCheatList().some((c) => normalizeCode(c.code) === norm)) {
+      toast("That cheat code is already in the list", "warn");
       return;
     }
-    toggleCheat(name, norm, true, { custom: true });
+    toggleCheat(name, norm, true, { custom: true, type });
     $("#ccName").value = "";
     $("#ccCode").value = "";
     toast("Cheat added and switched on", "success");
@@ -1043,37 +1837,44 @@
     toast("Re-applied enabled cheats", "success");
   });
   $("#btnClearCheats").addEventListener("click", () => {
+    const codes = getCheatList().map((cheat) => cheat.code);
     setCheatList([]);
-    for (const c of (emulator()?.cheats || [])) engineSetCheat(c.code, false);
+    const cleared = !S.running || engineClearCheats(codes);
     renderCheats();
-    toast("Cheat list cleared", "info");
+    toast(cleared
+      ? "Cheat list cleared. Values already written into the game are not automatically reversed."
+      : "The list was cleared, but the core could not update live. Stop and relaunch the game.", cleared ? "info" : "error", 6500);
   });
 
   /* ========================================================================
      RENDER: SAVES
      ===================================================================== */
   async function renderSaves() {
+    const current = S.current;
+    const currentGid = current && current.gid;
     const badge = $("#stateGameBadge");
-    badge.textContent = S.current ? baseName(S.current.name) : "no game loaded";
+    badge.textContent = current ? baseName(current.name) : "no game loaded";
     const grid = $("#slotGrid");
     grid.innerHTML = "";
 
-    const keys = S.current ? await IDB.keys("states").catch(() => []) : [];
+    const keys = current ? await IDB.keys("states").catch(() => []) : [];
+    if ((S.current && S.current.gid) !== currentGid) return;
     for (let slot = 1; slot <= 5; slot++) {
-      const key = S.current ? S.current.gid + ":" + slot : null;
+      const key = current ? current.gid + ":" + slot : null;
       const rec = key && keys.includes(key) ? await IDB.get("states", key).catch(() => null) : null;
+      if ((S.current && S.current.gid) !== currentGid) return;
       const el = document.createElement("div");
       el.className = "slot" + (rec ? "" : " is-empty");
-      const thumbStyle = rec && rec.thumb ? 'style="background-image:url(' + rec.thumb + ')"' : "";
       el.innerHTML =
-        '<div class="thumb" ' + thumbStyle + ">" + (rec && !rec.thumb ? "🎞" : "") + "</div>" +
+        '<div class="thumb">' + (rec && !rec.thumb ? "🎞" : "") + "</div>" +
         '<div class="s-body"><div class="s-title">Slot ' + slot + "</div>" +
         '<div class="s-meta">' + (rec ? fmtWhen(rec.at) + " · " + fmtBytes(rec.size) : "empty") + "</div>" +
         '<div class="s-actions">' +
-        '<button class="btn btn-ghost" data-act="save" ' + (S.running ? "" : "disabled") + ">Save</button>" +
-        '<button class="btn btn-ghost" data-act="load" ' + (rec && S.running ? "" : "disabled") + ">Load</button>" +
-        (rec ? '<button class="btn btn-ghost" data-act="del" title="Delete slot">×</button>' : "") +
+        '<button type="button" class="btn btn-ghost" data-act="save" ' + (S.running ? "" : "disabled") + ">Save</button>" +
+        '<button type="button" class="btn btn-ghost" data-act="load" ' + (rec && S.running ? "" : "disabled") + ">Load</button>" +
+        (rec ? '<button type="button" class="btn btn-ghost" data-act="del" aria-label="Delete slot ' + slot + '" title="Delete slot">×</button>' : "") +
         "</div></div>";
+      if (rec && rec.thumb) $(".thumb", el).style.backgroundImage = 'url("' + rec.thumb.replace(/"/g, "%22") + '")';
       $('[data-act="save"]', el).addEventListener("click", () => captureState(slot));
       $('[data-act="load"]', el).addEventListener("click", () => applyState(slot));
       const del = $('[data-act="del"]', el);
@@ -1113,19 +1914,27 @@
     toast("Exported .sav", "success");
   });
 
-  function wireSavImport(btn, input) {
-    $(btn).addEventListener("click", () => {
-      if (!S.current) { toast("Load the matching game first", "warn", 4500); return; }
-      $(input).click();
-    });
+  function wireSavImport(buttons, input) {
+    for (const btn of buttons) {
+      $(btn).addEventListener("click", () => {
+        if (!S.current) { toast("Load the matching game first", "warn", 4500); return; }
+        $(input).click();
+      });
+    }
     $(input).addEventListener("change", async (e) => {
       const f = e.target.files && e.target.files[0];
       e.target.value = "";
-      if (!f) return;
+      if (!f || !S.current) return;
       const buf = await f.arrayBuffer();
-      if (buf.byteLength < 512) { toast("That doesn't look like a .sav file", "error"); return; }
+      if (buf.byteLength < 512 || buf.byteLength > 16 * 1024 * 1024) { toast("That doesn't look like a .sav file", "error"); return; }
+      const current = S.current;
       try {
-        await IDB.put("saves", S.current.gid, { data: buf, at: Date.now(), name: S.current.name });
+        const existing = await IDB.get("saves", current.gid).catch(() => null);
+        const history = existing && existing.data
+          ? [{ data: existing.data, at: existing.at || Date.now(), sig: existing.sig || bytesSig(new Uint8Array(existing.data)) }, ...(existing.history || [])].slice(0, 2)
+          : [];
+        await IDB.put("saves", current.gid, { data: buf, at: Date.now(), name: current.name, enginePath: S.running ? saveFilePath() : null, sig: bytesSig(new Uint8Array(buf)), history });
+        if (!S.current || S.current.gid !== current.gid) return;
         S.savedSave = new Uint8Array(buf);
         S.savedSaveAt = Date.now();
         S.lastSaveSig = bytesSig(S.savedSave);
@@ -1137,13 +1946,46 @@
       }
     });
   }
-  wireSavImport("#btnImportSav", "#savInput");
-  wireSavImport("#btnQuickImportSav", "#savInput");
+  wireSavImport(["#btnImportSav", "#btnQuickImportSav"], "#savInput");
+
+  $("#btnRestoreSav").addEventListener("click", async () => {
+    if (!S.current) { toast("Load a game first", "warn"); return; }
+    await syncSaveNow({ force: true }).catch(() => {});
+    const current = S.current;
+    const rec = await IDB.get("saves", current.gid).catch(() => null);
+    const previous = rec && rec.history && rec.history[0];
+    if (!previous || !previous.data) { toast("No previous automatic save copy is available yet", "warn", 5000); return; }
+    if (!confirm("Restore the previous battery save from " + fmtWhen(previous.at) + "? The current save will remain as a rolling backup.")) return;
+    const currentCopy = { data: rec.data, at: rec.at, sig: rec.sig || bytesSig(new Uint8Array(rec.data)) };
+    const restored = {
+      ...rec,
+      data: previous.data,
+      at: Date.now(),
+      sig: previous.sig || bytesSig(new Uint8Array(previous.data)),
+      history: [currentCopy, ...(rec.history || []).slice(1)].slice(0, 2),
+    };
+    try {
+      await IDB.put("saves", current.gid, restored);
+      S.savedSave = new Uint8Array(restored.data);
+      S.savedSaveAt = restored.at;
+      S.lastSaveSig = restored.sig;
+      if (S.running) await restoreBatterySave();
+      renderSavPanel();
+      toast("Previous battery save restored", "success");
+    } catch (error) {
+      toast("Could not restore the previous save", "error");
+    }
+  });
 
   $("#btnDeleteSav").addEventListener("click", async () => {
     if (!S.current) return;
-    if (!confirm("Delete the stored .sav for " + baseName(S.current.name) + "? Export it first if you might want it back.")) return;
-    await IDB.del("saves", S.current.gid).catch(() => {});
+    const current = S.current;
+    if (!confirm("Delete the stored .sav for " + baseName(current.name) + "?" + (S.running ? " The running game will be stopped so it cannot recreate the save." : "") + " Export it first if you might want it back.")) return;
+    const existing = await IDB.get("saves", current.gid).catch(() => null);
+    const livePath = S.running ? saveFilePath() : null;
+    if (S.running) await stopGame({ silent: true });
+    await IDB.del("saves", current.gid).catch(() => {});
+    await deleteEngineSaveRecords([livePath, existing && existing.enginePath]);
     S.savedSave = null; S.savedSaveAt = 0; S.lastSaveSig = null;
     renderSavPanel();
     toast("Stored .sav deleted", "warn");
@@ -1158,14 +2000,349 @@
     if (f) importStateFile(f);
   });
 
+  function bytesToBase64(value) {
+    const bytes = asBytes(value);
+    let binary = "";
+    for (let offset = 0; offset < bytes.length; offset += 0x8000) {
+      binary += String.fromCharCode(...bytes.subarray(offset, offset + 0x8000));
+    }
+    return btoa(binary);
+  }
+
+  function base64ToBytes(value) {
+    const binary = atob(value);
+    const bytes = new Uint8Array(binary.length);
+    for (let index = 0; index < binary.length; index++) bytes[index] = binary.charCodeAt(index);
+    return bytes;
+  }
+
+  async function encodeBackupValue(value) {
+    const isBuffer = Object.prototype.toString.call(value) === "[object ArrayBuffer]";
+    if (isBuffer || ArrayBuffer.isView(value)) {
+      const bytes = asBytes(value);
+      return { __pixelgbaBytes: bytesToBase64(bytes), byteLength: bytes.length, sha256: await digestHex(bytes) };
+    }
+    if (Array.isArray(value)) return Promise.all(value.map(encodeBackupValue));
+    if (value && typeof value === "object") {
+      const result = {};
+      for (const [key, child] of Object.entries(value)) result[key] = await encodeBackupValue(child);
+      return result;
+    }
+    return value;
+  }
+
+  async function decodeBackupValue(value, depth = 0) {
+    if (depth > 12) throw new Error("Backup nesting is invalid");
+    if (value && typeof value === "object" && typeof value.__pixelgbaBytes === "string") {
+      const bytes = base64ToBytes(value.__pixelgbaBytes);
+      if (bytes.length !== value.byteLength || await digestHex(bytes) !== value.sha256) throw new Error("A backup binary checksum does not match");
+      return ownBuffer(bytes);
+    }
+    if (Array.isArray(value)) return Promise.all(value.map((child) => decodeBackupValue(child, depth + 1)));
+    if (value && typeof value === "object") {
+      const result = {};
+      for (const [key, child] of Object.entries(value)) result[key] = await decodeBackupValue(child, depth + 1);
+      return result;
+    }
+    return value;
+  }
+
+  async function transformBackupEntries(entries, type, { signal = null, onProgress = null } = {}) {
+    if (typeof Worker !== "undefined") {
+      try { return await runDataWorker(type, { entries }, { signal, onProgress }); }
+      catch (error) {
+        if (error.name === "AbortError") throw error;
+        console.warn("Backup worker unavailable; falling back to the main thread", error);
+      }
+    }
+    const transform = type === "encodeEntries" ? encodeBackupValue : decodeBackupValue;
+    const output = [];
+    for (let index = 0; index < entries.length; index++) {
+      if (signal?.aborted) throw new DOMException("Operation cancelled", "AbortError");
+      output.push([entries[index][0], await transform(entries[index][1])]);
+      onProgress?.((index + 1) / Math.max(1, entries.length) * 100, type === "encodeEntries" ? "Encoding backup…" : "Verifying backup…");
+    }
+    return output;
+  }
+
+  async function createBackupDocument({ signal = null, onProgress = null } = {}) {
+    if (S.running) await syncSaveNow({ force: true }).catch(() => {});
+    const local = store.allKeys()
+      .filter((key) => key.startsWith("pgba.") || key.startsWith("ejs-pgba-") || key === "ejs-settings")
+      .map((key) => [key, store.raw(key)]);
+    const rawEntries = [
+      ...(await IDB.entries("saves").catch(() => [])).map(([key, value]) => ["s:" + String(key), value]),
+      ...(await IDB.entries("states").catch(() => [])).map(([key, value]) => ["t:" + String(key), value]),
+    ];
+    const encoded = await transformBackupEntries(rawEntries, "encodeEntries", { signal, onProgress });
+    const saves = encoded.filter(([key]) => key.startsWith("s:")).map(([key, value]) => [key.slice(2), value]);
+    const states = encoded.filter(([key]) => key.startsWith("t:")).map(([key, value]) => [key.slice(2), value]);
+    const payload = { schema: 1, appVersion: "1.3.0", local, saves, states };
+    const payloadText = JSON.stringify(payload);
+    return {
+      format: BACKUP_FORMAT,
+      createdAt: Date.now(),
+      payloadSha256: await digestHex(textEncoder.encode(payloadText)),
+      payload,
+    };
+  }
+
+  async function validateBackupDocument(documentValue, { signal = null, onProgress = null } = {}) {
+    if (!documentValue || documentValue.format !== BACKUP_FORMAT || !documentValue.payload) throw new Error("This is not a PixelGBA backup");
+    const payloadText = JSON.stringify(documentValue.payload);
+    if (documentValue.payloadSha256 !== await digestHex(textEncoder.encode(payloadText))) throw new Error("The backup manifest checksum does not match");
+    const payload = documentValue.payload;
+    if (payload.schema !== 1 || !Array.isArray(payload.local) || !Array.isArray(payload.saves) || !Array.isArray(payload.states)) throw new Error("The backup schema is unsupported");
+    if (payload.local.length + payload.saves.length + payload.states.length > 10_000) throw new Error("The backup contains too many records");
+    const safeLocal = payload.local.map(([key, raw]) => {
+      if (typeof key !== "string" || typeof raw !== "string" || !(key.startsWith("pgba.") || key.startsWith("ejs-pgba-") || key === "ejs-settings")) throw new Error("The backup contains an unsafe settings key");
+      return [key, raw];
+    });
+    const entries = [
+      ...payload.saves.map((entry) => ["s:", entry]),
+      ...payload.states.map((entry) => ["t:", entry]),
+    ].map(([prefix, entry]) => {
+      if (!Array.isArray(entry) || typeof entry[0] !== "string" || entry[0].length > 256) throw new Error("The backup contains an invalid database key");
+      return [prefix + entry[0], entry[1]];
+    });
+    const decoded = await transformBackupEntries(entries, "decodeEntries", { signal, onProgress });
+    return {
+      local: safeLocal,
+      saves: decoded.filter(([key]) => key.startsWith("s:")).map(([key, value]) => [key.slice(2), value]),
+      states: decoded.filter(([key]) => key.startsWith("t:")).map(([key, value]) => [key.slice(2), value]),
+    };
+  }
+
+  async function exportFullBackup() {
+    const operation = beginOperation("Preparing full backup…");
+    try {
+      const backup = await createBackupDocument({ signal: operation.signal, onProgress: updateOperation });
+      updateOperation(100, "Backup ready");
+      downloadBlob(new Blob([JSON.stringify(backup)], { type: "application/json" }), "pixelgba-backup-" + tsName() + ".pgbackup");
+      persist(K_LAST_BACKUP, Date.now(), "the backup reminder");
+      refreshStorageHealth();
+      toast("Full backup exported with checksums", "success");
+    } catch (error) {
+      if (error.name === "AbortError") toast("Backup export cancelled", "info");
+      else { console.warn("backup export failed", error); toast("Could not export the full backup", "error", 6000); }
+    } finally { finishOperation(operation); }
+  }
+
+  async function restoreFullBackup(file) {
+    if (!file || file.size > 768 * 1024 * 1024) { toast("That backup is too large to restore safely", "error"); return; }
+    const verifyOperation = beginOperation("Reading backup…");
+    let decoded;
+    try {
+      updateOperation(5, "Reading backup…");
+      decoded = await validateBackupDocument(JSON.parse(await file.text()), { signal: verifyOperation.signal, onProgress: updateOperation });
+    } catch (error) {
+      if (error.name === "AbortError") toast("Backup restore cancelled", "info");
+      else toast(error.message || "That backup is invalid", "error", 7000);
+      return;
+    } finally { finishOperation(verifyOperation); }
+    if (!confirm("Restore this verified PixelGBA backup? Current PixelGBA ROMs, saves, states, cheats and settings on this site will be replaced.")) return;
+    const restoreOperation = beginOperation("Restoring verified backup…", { cancelable: false });
+    try {
+      await stopGame({ silent: true });
+      await deleteOwnedEngineFilesystem();
+      store.allKeys()
+        .filter((key) => key.startsWith("pgba.") || key.startsWith("ejs-pgba-") || key === "ejs-settings")
+        .forEach((key) => store.del(key));
+      await IDB.clear("saves");
+      await IDB.clear("states");
+      for (const [key, raw] of decoded.local) {
+        if (!store.setRaw(key, raw)) throw new Error("Browser settings storage is full");
+      }
+      let done = 0; const total = decoded.saves.length + decoded.states.length;
+      for (const [key, value] of decoded.saves) { await IDB.put("saves", key, value); updateOperation(++done / Math.max(1, total) * 100, "Restoring backup…"); }
+      for (const [key, value] of decoded.states) { await IDB.put("states", key, value); updateOperation(++done / Math.max(1, total) * 100, "Restoring backup…"); }
+      toast("Backup restored — reloading…", "success");
+      setTimeout(() => location.reload(), 800);
+    } catch (error) {
+      console.warn("backup restore failed", error);
+      toast("Restore stopped because browser storage rejected a record. Keep the backup file and free site storage before retrying.", "error", 9000);
+    } finally { finishOperation(restoreOperation); }
+  }
+
+  $("#btnExportBackup").addEventListener("click", exportFullBackup);
+  $("#btnImportBackup").addEventListener("click", () => $("#backupInput").click());
+  $("#backupInput").addEventListener("change", (event) => {
+    const file = event.target.files && event.target.files[0];
+    event.target.value = "";
+    if (file) restoreFullBackup(file);
+  });
+
+
+  function diagnosticCategory(value) {
+    const text = String(value && typeof value === "object" ? [value.name, value.message, value.reason].filter(Boolean).join(" ") : value || "").toLowerCase();
+    if (/quota|storage full/.test(text)) return "storage-quota";
+    if (/indexeddb|database|transaction/.test(text)) return "storage-database";
+    if (/abort|cancel/.test(text)) return "cancelled-operation";
+    if (/network|fetch|offline|load failed/.test(text)) return "network-or-offline";
+    if (/worker/.test(text)) return "background-worker";
+    if (/webgl|graphics|context/.test(text)) return "graphics-context";
+    if (/wasm|webassembly/.test(text)) return "emulator-runtime";
+    if (/archive|zip|rar|7z|decompress/.test(text)) return "archive-processing";
+    if (/permission|security|denied|notallowed/.test(text)) return "browser-permission";
+    return "application-error";
+  }
+  function rememberDiagnosticError(value) {
+    S.diagnostics.push({ at: Date.now(), category: diagnosticCategory(value) });
+    S.diagnostics = S.diagnostics.slice(-10);
+  }
+  window.addEventListener("error", (event) => rememberDiagnosticError(event.error || event.message));
+  window.addEventListener("unhandledrejection", (event) => rememberDiagnosticError(event.reason));
+
+  async function getStorageHealth() {
+    let estimate = { usage: null, quota: null }, persisted = null;
+    try { if (navigator.storage?.estimate) estimate = await navigator.storage.estimate(); } catch (error) { rememberDiagnosticError(error); }
+    try { if (navigator.storage?.persisted) persisted = await navigator.storage.persisted(); } catch (error) { rememberDiagnosticError(error); }
+    return { usage: estimate.usage ?? null, quota: estimate.quota ?? null, persisted };
+  }
+
+  async function refreshStorageHealth() {
+    const elements = {
+      used: $("#storageUsed"), quota: $("#storageQuota"), progress: $("#storageProgress"),
+      badge: $("#storagePersistBadge"), persist: $("#btnPersistStorage"), advice: $("#storageAdvice"), reminder: $("#backupReminder"),
+    };
+    const health = await getStorageHealth();
+    if (!elements.used?.isConnected) return health;
+    const ratio = health.usage !== null && health.quota ? health.usage / health.quota : 0;
+    elements.used.textContent = health.usage === null ? "Storage estimate unavailable" : fmtBytes(health.usage) + " used";
+    elements.quota.textContent = health.quota === null ? "" : fmtBytes(Math.max(0, health.quota - (health.usage || 0))) + " available of " + fmtBytes(health.quota);
+    elements.progress.value = Math.round(ratio * 100);
+    elements.badge.textContent = health.persisted === true ? "protected" : health.persisted === false ? "evictable" : "unknown";
+    elements.persist.disabled = health.persisted === true || !navigator.storage?.persist;
+    const low = ratio >= .8 || (health.quota && health.usage !== null && health.quota - health.usage < 100 * 1024 * 1024);
+    elements.advice.textContent = low
+      ? "Storage is running low. Export a full backup and remove games or states you no longer need."
+      : health.persisted === true
+        ? "The browser reports this site's storage as persistent. Full backups are still recommended."
+        : "This data may be evicted under device pressure. Choose Protect local data and keep full backups.";
+    const lastBackup = store.get(K_LAST_BACKUP, 0);
+    const backupDue = S.roms.length > 0 && (!lastBackup || Date.now() - lastBackup > 30 * 86400000);
+    elements.reminder.hidden = !backupDue;
+    elements.reminder.textContent = lastBackup
+      ? "Your last recorded full backup was " + fmtWhen(lastBackup) + ". Export a fresh copy before major changes."
+      : "No full backup has been recorded on this device. Export one before relying on browser storage.";
+    return health;
+  }
+
+
+  $("#btnPersistStorage").addEventListener("click", async () => {
+    if (!navigator.storage?.persist) { toast("This browser does not expose persistent-storage requests", "warn"); return; }
+    let granted = false;
+    try { granted = await navigator.storage.persist(); } catch (error) { rememberDiagnosticError(error); }
+    toast(granted ? "Browser storage protection enabled" : "The browser did not grant persistent storage — keep regular backups", granted ? "success" : "warn", 6000);
+    refreshStorageHealth();
+  });
+  $("#btnRefreshStorage").addEventListener("click", refreshStorageHealth);
+
+  window.addEventListener("beforeinstallprompt", (event) => {
+    event.preventDefault();
+    S.installPrompt = event;
+    $("#btnInstallApp").hidden = false;
+    $("#installHint").textContent = "Install PixelGBA for a standalone app window; your local data remains in this browser profile.";
+  });
+  window.addEventListener("appinstalled", () => {
+    S.installPrompt = null;
+    $("#btnInstallApp").hidden = true;
+    $("#installHint").textContent = "PixelGBA is installed. Updates remain under your control through the in-app prompt.";
+    toast("PixelGBA installed", "success");
+  });
+  if ((window.matchMedia && window.matchMedia("(display-mode: standalone)").matches) || navigator.standalone === true) {
+    $("#installHint").textContent = "PixelGBA is running as an installed app.";
+  }
+  $("#btnInstallApp").addEventListener("click", async () => {
+    if (!S.installPrompt) { toast("Use your browser's Install app or Add to Home Screen command", "info", 5000); return; }
+    S.installPrompt.prompt();
+    const choice = await S.installPrompt.userChoice.catch(() => null);
+    S.installPrompt = null;
+    $("#btnInstallApp").hidden = true;
+    if (choice?.outcome !== "accepted") toast("Installation dismissed", "info");
+  });
+
+  function capabilitySnapshot() {
+    const canvas = document.createElement("canvas");
+    let webgl = false, webgl2 = false;
+    try {
+      if ("WebGLRenderingContext" in window) {
+        webgl2 = "WebGL2RenderingContext" in window && !!canvas.getContext("webgl2");
+        webgl = webgl2 || !!canvas.getContext("webgl");
+      }
+    } catch (error) {}
+    return {
+      WebAssembly: typeof WebAssembly !== "undefined",
+      IndexedDB: !!window.indexedDB,
+      WebGL: webgl,
+      WebGL2: webgl2,
+      "Service worker": "serviceWorker" in navigator,
+      "Background workers": typeof Worker !== "undefined",
+      "Archive streams": typeof DecompressionStream !== "undefined",
+      Gamepad: "getGamepads" in navigator,
+    };
+  }
+  function renderCapabilities() {
+    const grid = $("#capabilityGrid"); grid.innerHTML = "";
+    for (const [name, available] of Object.entries(capabilitySnapshot())) {
+      const chip = document.createElement("span");
+      chip.className = "capability " + (available ? "is-ok" : "is-bad");
+      chip.textContent = (available ? "✓ " : "× ") + name;
+      grid.appendChild(chip);
+    }
+  }
+  function browserFamily() {
+    const ua = navigator.userAgent || "";
+    if (/Firefox\//.test(ua)) return "Firefox";
+    if (/Edg\//.test(ua)) return "Edge (Chromium)";
+    if (/Chrom(?:e|ium)\//.test(ua)) return "Chromium";
+    if (/Safari\//.test(ua) && !/Chrom/.test(ua)) return "Safari/WebKit";
+    return "Unknown";
+  }
+  async function exportDiagnostics() {
+    const storageHealth = await getStorageHealth();
+    let workerState = "unsupported";
+    try {
+      const registration = await navigator.serviceWorker?.getRegistration();
+      workerState = registration ? (registration.active?.state || registration.waiting?.state || registration.installing?.state || "registered") : "not registered";
+    } catch (error) { rememberDiagnosticError(error); }
+    const report = {
+      format: "pixelgba-diagnostics-v1",
+      createdAt: new Date().toISOString(),
+      privacy: "Contains no ROMs, saves, cheats, filenames, page URLs, or hardware identifiers.",
+      app: { version: "1.3.0", build: window.PIXELGBA_BUILD?.id || "unknown", emulator: EMULATOR_VERSION, core: CORE_ID },
+      browser: { family: browserFamily(), secureContext: window.isSecureContext, standalone: !!(window.matchMedia && window.matchMedia("(display-mode: standalone)").matches), framed: IS_FRAMED },
+      capabilities: capabilitySnapshot(),
+      storage: storageHealth,
+      serviceWorker: workerState,
+      recentErrors: S.diagnostics.slice(),
+    };
+    downloadBlob(new Blob([JSON.stringify(report, null, 2)], { type: "application/json" }), "pixelgba-diagnostics-" + tsName() + ".json");
+    toast("Privacy-safe diagnostic report exported", "success");
+  }
+  $("#btnExportDiagnostics").addEventListener("click", exportDiagnostics);
+  renderCapabilities();
+  refreshStorageHealth();
+
   /* ========================================================================
      HELP → wipe everything
      ===================================================================== */
   $("#btnWipe").addEventListener("click", async () => {
-    if (!confirm("Delete ALL ROMs, saves, states and cheat lists stored by PixelGBA on this computer?")) return;
+    if (!confirm("Delete ALL ROMs, saves, states, cheats and PixelGBA emulator settings stored on this device? This cannot be undone.")) return;
     await stopGame({ silent: true });
-    store.allKeys().filter((k) => k.startsWith("pgba.")).forEach((k) => store.del(k));
-    await IDB.clear("saves"); await IDB.clear("states");
+    const saveKeys = await IDB.keys("saves").catch(() => []);
+    const enginePaths = [];
+    for (const key of saveKeys.filter((key) => !String(key).startsWith("__rom__"))) {
+      const rec = await IDB.get("saves", key).catch(() => null);
+      if (rec && rec.enginePath) enginePaths.push(rec.enginePath);
+    }
+    await deleteEngineSaveRecords(enginePaths);
+    await deleteOwnedEngineFilesystem();
+    store.allKeys()
+      .filter((key) => key.startsWith("pgba.") || key.startsWith("ejs-pgba-") || key === "ejs-settings")
+      .forEach((key) => store.del(key));
+    await IDB.clear("saves");
+    await IDB.clear("states");
     toast("Local data cleared — reloading…", "warn");
     setTimeout(() => location.reload(), 800);
   });
@@ -1188,6 +2365,35 @@
   /* ========================================================================
      BOOT
      ===================================================================== */
+  activateTab(tabs.find((tab) => tab.classList.contains("is-active")) || tabs[0]);
+  if ("serviceWorker" in navigator && /^https?:$/.test(location.protocol)) {
+    let waitingWorker = null;
+    let applyingUpdate = false;
+    const showUpdate = (worker) => {
+      waitingWorker = worker;
+      $("#updateBanner").hidden = false;
+    };
+    navigator.serviceWorker.addEventListener("controllerchange", () => {
+      if (applyingUpdate) location.reload();
+    });
+    $("#btnApplyUpdate").addEventListener("click", () => {
+      if (!waitingWorker) return;
+      applyingUpdate = true;
+      waitingWorker.postMessage({ type: "SKIP_WAITING" });
+    });
+    $("#updateClose").addEventListener("click", () => { $("#updateBanner").hidden = true; });
+    navigator.serviceWorker.register(new URL("sw.js", location.href)).then((registration) => {
+      if (registration.waiting) showUpdate(registration.waiting);
+      registration.addEventListener("updatefound", () => {
+        const worker = registration.installing;
+        if (!worker) return;
+        worker.addEventListener("statechange", () => {
+          if (worker.state === "installed" && navigator.serviceWorker.controller) showUpdate(worker);
+        });
+      });
+      registration.update().catch(() => {});
+    }).catch((error) => console.warn("Offline cache registration failed", error));
+  }
   renderLibrary();
   renderSaves();
   renderCheats();
@@ -1218,6 +2424,19 @@
     getCheatList,
     validateCode,
     normalizeCode,
-    version: "1.0.0",
+    identifyRom,
+    parseGbaHeader,
+    packStateFile,
+    unpackStateFile,
+    createBackupDocument,
+    validateBackupDocument,
+    bytesSig,
+    nextFreeSlot,
+    renderLibrary,
+    deleteGameData,
+    refreshStorageHealth,
+    capabilitySnapshot,
+    storage: IDB,
+    version: "1.3.0",
   };
 })();

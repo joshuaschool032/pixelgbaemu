@@ -1,0 +1,30 @@
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: monthly
+    groups:
+      browser-testing:
+        patterns:
+          - "@playwright/*"
+          - "@sparticuz/chromium"
+      dom-testing:
+        patterns:
+          - jsdom
+          - fake-indexeddb
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    groups:
+      actions:
+        patterns:
+          - "*"
+    open-pull-requests-limit: 3
+    labels:
+      - dependencies

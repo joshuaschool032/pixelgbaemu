@@ -45,6 +45,8 @@
                     return scriptPath + file;
                 }
             }();
+            const duplicate = Array.from(document.querySelectorAll('link[rel="stylesheet"]')).some((link) => link.href === css.href);
+            if (duplicate) { resolve(); return; }
             css.onload = resolve;
             css.onerror = () => {
                 filesmissing(file).then(e => resolve());
@@ -75,8 +77,28 @@
         }
         await loadStyle("emulator.css");
     } else {
-        await loadScript("emulator.min.js");
+        if (!window.EmulatorJS) await loadScript("emulator.min.js");
         await loadStyle("emulator.min.css");
+    }
+    // ---- PixelGBA patch: retain every DOM listener so repeated sessions can dispose it ----
+    if (window.EmulatorJS && !window.EmulatorJS.prototype.__pgbaTracksListeners) {
+        const proto = window.EmulatorJS.prototype;
+        const originalAdd = proto.addEventListener;
+        proto.__pgbaTracksListeners = true;
+        // EmulatorJS checks its CDN automatically on localhost and does not catch an
+        // offline rejection. PixelGBA pins/validates assets locally instead.
+        proto.checkForUpdates = function() {};
+        proto.addEventListener = function(target, events, callback) {
+            const refs = originalAdd.call(this, target, events, callback);
+            this.__pgbaDomListeners = (this.__pgbaDomListeners || []).concat(refs || []);
+            return refs;
+        };
+        proto.pgbaDisposeListeners = function() {
+            for (const ref of (this.__pgbaDomListeners || [])) {
+                try { ref.elem.removeEventListener(ref.listener, ref.cb); } catch (e) {}
+            }
+            this.__pgbaDomListeners = [];
+        };
     }
     // ---- PixelGBA patch: localStorage throws in sandboxed/preview contexts ----
     try { window.localStorage.getItem("ejs_settings"); }
@@ -94,14 +116,23 @@
     }
     // ---- PixelGBA patch: IndexedDB can be denied in sandboxed/preview contexts ----
     // EmulatorJS only uses it as a cache; fall back to inert stand-ins when unavailable.
-    function pgbaIdbUnavailable() {
+    async function pgbaIdbUnavailable() {
+        if (!window.indexedDB) return true;
         try {
-            const req = window.indexedDB.open("__pgba_probe__");
-            if (req && typeof req.addEventListener === "function") req.addEventListener("error", () => {});
-            return false;
+            return await new Promise((resolve) => {
+                const req = window.indexedDB.open("__pgba_probe__");
+                const timer = setTimeout(() => resolve(true), 1500);
+                req.onerror = () => { clearTimeout(timer); resolve(true); };
+                req.onblocked = () => { clearTimeout(timer); resolve(true); };
+                req.onsuccess = () => {
+                    clearTimeout(timer);
+                    try { req.result.close(); window.indexedDB.deleteDatabase("__pgba_probe__"); } catch (e) {}
+                    resolve(false);
+                };
+            });
         } catch (e) { return true; }
     }
-    if (pgbaIdbUnavailable()) {
+    if (await pgbaIdbUnavailable()) {
         // Minimal in-memory IDB stand-in that supports both property and addEventListener handlers.
         const makeReq = (done) => {
             const evs = {};
@@ -152,25 +183,23 @@
     // ---- PixelGBA patch (flat builds): never "normalise" a bare filename into
     // a folder URL. With all engine files at the site root, the browser may resolve
     // "loader.js" as "/repo/" instead of "/repo/loader.js".
-    if (window.PIXELGBA_FLAT_PATHS) {
-        const absolute = (u) => (u.startsWith("http") ? u : new URL(u, location.href).href);
+    if (window.PIXELGBA_FLAT_PATHS && !window.__PGBA_CREATE_ELEMENT_PATCHED) {
+        window.__PGBA_CREATE_ELEMENT_PATCHED = true;
+        const absolute = (u) => (/^(https?:|blob:|data:)/.test(u) ? u : new URL(u, location.href).href);
         try {
             const origCreate = document.createElement.bind(document);
-            document.createElement = function (tag) {
-                const el = origCreate(tag);
-                if (String(tag).toLowerCase() === "script") {
-                    const d = Object.getOwnPropertyDescriptor(HTMLScriptElement.prototype, "src");
+            const descriptor = Object.getOwnPropertyDescriptor(HTMLScriptElement.prototype, "src");
+            document.createElement = function (tag, options) {
+                const el = origCreate(tag, options);
+                if (String(tag).toLowerCase() === "script" && descriptor) {
                     Object.defineProperty(el, "src", {
                         configurable: true,
-                        get() { return d.get.call(this); },
-                        set(v) { d.set.call(this, absolute(String(v))); },
+                        get() { return descriptor.get.call(this); },
+                        set(v) { descriptor.set.call(this, absolute(String(v))); },
                     });
                 }
                 return el;
             };
-        } catch (e) {}
-        try {
-            const origSet = CSSStyleSheet.prototype; // no-op, kept for clarity
         } catch (e) {}
     }
     // ---- PixelGBA patch (flat builds): use the language JSON preloaded by app.js ----
