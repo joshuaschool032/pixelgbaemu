@@ -10,7 +10,7 @@ const required = [
   "index.html", "styles.css", "app.js", "cheats-db.js", "loader.js",
   "emulator.min.js", "emulator.min.css", "en-US.json", "version.json", "mgba.json",
   "mgba-wasm.data", "mgba-legacy-wasm.data", "extract7z.js", "extractzip.js",
-  "libunrar.js", "libunrar.wasm", "sw.js", "check.html", "README.md", "LICENSE",
+  "libunrar.js", "libunrar.wasm", "sw.js", "build-info.js", "check.html", "README.md", "LICENSE",
   "THIRD_PARTY_NOTICES.md", "LICENSES/MPL-2.0.txt", "LICENSES/UnRAR.txt",
   "LICENSES/7-Zip.txt", "serve.js", "serve.sh", "serve.ps1", "serve.bat"
 ];
@@ -34,7 +34,7 @@ for (const artifact of lock.artifacts) {
   if (!artifact.source || !artifact.license || !artifact.version) errors.push(`incomplete vendor metadata: ${artifact.path}`);
 }
 
-for (const name of ["app.js", "cheats-db.js", "loader.js", "serve.js", "sw.js", "playwright.config.js"]) {
+for (const name of ["app.js", "cheats-db.js", "loader.js", "serve.js", "sw.js", "build-info.js", "playwright.config.js", "scripts/generate-build-info.mjs"]) {
   try { execFileSync(process.execPath, ["--check", resolve(root, name)], { stdio: "pipe" }); }
   catch (error) { errors.push(`syntax check failed: ${name}\n${error.stderr?.toString() || error.message}`); }
 }

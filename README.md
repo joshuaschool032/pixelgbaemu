@@ -1,6 +1,6 @@
 # PixelGBA
 
-PixelGBA is a static, browser-based Game Boy Advance emulator UI built around EmulatorJS 4.2.3 and its mGBA core. It provides a local ROM library, five save-state slots, battery-save import/export and automatic persistence, screenshots, and per-game cheat lists. ROMs and saves stay in browser storage; no game or BIOS content is included.
+PixelGBA is a static, browser-based Game Boy Advance emulator UI built around EmulatorJS 4.2.3 and its mGBA core. It provides a searchable local ROM library, validated save states, battery-save history, complete backup/restore, screenshots, and per-game cheat lists. ROMs and saves stay in browser storage; no game or BIOS content is included.
 
 ## Quick start
 
@@ -27,7 +27,7 @@ Do not open `index.html` through `file://`; browser security rules prevent the e
 
 The app is intentionally flat and needs no production build. Serve every tracked runtime file from one directory over HTTPS. For GitHub Pages, deploy the repository root from the default branch. Open `check.html` after deploying to verify every required runtime asset.
 
-A service worker caches the local app and engine files after the first complete visit. Once installation succeeds, the UI and bundled engine can load offline. Browser storage and service-worker caches remain origin-specific; changing the deployment URL creates a separate library.
+A service worker caches the local app and engine files after the first complete visit. Its cache key comes from the generated `build-info.js` content manifest. A deployed update waits and shows an **Update and reload** prompt instead of mixing old UI files with a new runtime during a game. Browser storage and service-worker caches remain origin-specific; changing the deployment URL creates a separate library.
 
 ## Browser support
 
@@ -35,10 +35,12 @@ Use a current Chromium, Firefox, or Safari release with WebAssembly, IndexedDB, 
 
 ## Storage and data safety
 
-- ROM contents are identified by SHA-256, not filename. Different revisions and ROM hacks therefore receive separate saves, states, and cheats.
-- Older filename-keyed data is migrated when that ROM is loaded for the first time after upgrading.
-- ROM blobs, battery saves, and states use IndexedDB. Library metadata and UI/engine settings use localStorage.
-- Battery saves are checked across the complete file every eight seconds, when the page is hidden, when pausing, and before teardown. Browsers cannot guarantee completion of asynchronous writes after a tab is force-closed.
+- Archives are extracted before SHA-256 identification, so a raw ROM and the same cartridge inside ZIP, 7z, or RAR storage share saves and settings. Different revisions and ROM hacks remain separate.
+- Older filename-keyed and archive-hash-keyed data is migrated when that ROM is loaded for the first time after upgrading.
+- ROM blobs, battery saves, and states use IndexedDB. Library metadata, favorites, and UI/engine settings use localStorage.
+- Battery saves sync on the emulator's SRAM flush event, with complete-file polling every eight seconds as a fallback. Writes are serialized and two previous copies are retained for recovery.
+- PixelGBA `.pgstate` exports include the ROM hash, cartridge header, core/runtime version, size, timestamp, and checksum. Legacy raw `.state` imports remain supported.
+- **Export full backup** creates one checksummed file containing cached ROMs, battery saves/history, states, cheats, favorites, and settings. Restore validates all binary records before replacing PixelGBA data.
 - **Remove from library (`×`)** deletes only the cached ROM/library entry and keeps saves, states, and cheats.
 - **Delete game data (`🗑`)** removes the ROM and all PixelGBA data for that content hash after confirmation.
 - Deleting a running battery save stops the game first so the core cannot immediately recreate it.
@@ -55,7 +57,7 @@ Use a current Chromium, Firefox, or Safari release with WebAssembly, IndexedDB, 
 | `emulator.min.*` | Vendored EmulatorJS runtime |
 | `mgba-*.data` | Vendored modern and legacy mGBA core archives |
 | `extract*`, `libunrar*` | Vendored archive extraction workers |
-| `sw.js` | Same-origin offline asset cache |
+| `sw.js`, `build-info.js` | Versioned same-origin offline cache and generated asset manifest |
 | `check.html` | Deployment asset self-check |
 | `vendor-lock.json` | Version, source, license, and SHA-256 manifest for vendored artifacts |
 
@@ -67,13 +69,17 @@ Node.js 20 or later is recommended.
 
 ```sh
 npm ci
-npm run check       # syntax, references, runtime files, and vendor hashes
+npm run build:meta  # regenerate build-info.js after changing a cached asset
+npm run check       # generated metadata, syntax, references, runtime files, vendor hashes
 npm test            # unit and DOM integration tests
-npm run test:e2e    # Playwright browser smoke test
+npm run test:e2e    # desktop + mobile Chromium smoke tests using packaged Chromium
+npm run test:e2e:cross-browser # Firefox + WebKit (requires Playwright browsers)
 npm run test:all
 ```
 
-The Playwright smoke test uses a pinned compressed headless Chromium from the npm registry, so it does not need a separate browser download. The end-to-end fixture is a tiny project-generated GBA program that loops forever and contains no commercial game data.
+The default Playwright smoke test uses a pinned compressed headless Chromium from the npm registry, so it does not need a separate browser download. CI additionally installs and tests Firefox and WebKit. Coverage includes desktop/mobile layouts, a mocked standard gamepad, save import/restore/delete, repeated mGBA boot/teardown, archive identity, storage-quota failures, backup checksums, and service assets. The end-to-end fixture is a tiny project-generated GBA program that loops forever and contains no commercial game data.
+
+Dependabot proposes monthly grouped updates for browser/DOM testing packages and GitHub Actions. EmulatorJS runtime upgrades remain manual because its loader, runtime, core, provenance, and patched hashes must move together.
 
 ## Updating vendored dependencies
 
@@ -82,7 +88,8 @@ The Playwright smoke test uses a pinned compressed headless Chromium from the np
 3. Reapply and document the readable PixelGBA patches in `loader.js`.
 4. Update `vendor-lock.json`, including SHA-256 digests and exact source URLs.
 5. Update `THIRD_PARTY_NOTICES.md` and files under `LICENSES/` when needed.
-6. Run `npm run test:all` and `check.html` from a real deployment.
+6. Run `npm run build:meta` so the offline cache receives a new content-derived version.
+7. Run `npm run test:all` and `check.html` from a real deployment.
 
 The mGBA archive metadata points to the `EmulatorJS/mgba` fork and the core build system is in `EmulatorJS/build`. See `THIRD_PARTY_NOTICES.md` for the source correspondence and rebuild caveat.
 
@@ -92,7 +99,9 @@ The mGBA archive metadata points to the `EmulatorJS/mgba` fork and the core buil
 - **A cached game will not reopen:** browser quota eviction may have removed its ROM blob. Choose the original file again; content-hash matching reconnects it to existing data.
 - **Save does not appear:** make an in-game save, leave the game running for at least eight seconds, then check the Saves tab. Export before closing if the UI reports a storage error.
 - **Black screen:** run `check.html`, try an uncompressed `.gba`, and verify WebGL is enabled.
-- **State import rejected:** states must match the game and compatible core build. Free one of the five slots before importing.
+- **State import rejected:** validated states must match the ROM hash and exact compatible core build. Legacy raw states are attempted by the core. Free one of the five slots before importing.
+- **Browser storage was evicted or you are moving devices:** restore a full `.pgbackup` exported from the Help tab.
+- **An update is available:** finish saving, then choose **Update and reload**. The waiting worker never replaces runtime assets in the middle of a session.
 
 ## License
 

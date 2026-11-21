@@ -20,6 +20,7 @@ window.PIXELGBA_PRESETS = {
       id: "emerald",
       title: "Pokémon Emerald",
       matches: ["emerald"],
+      headers: [{ gameCode: "BPEE", revisions: [0] }],
       accent: "#34d399",
       note: "Item cheats marked “PokéMart” replace the first item sold in any shop — buy it for $0. Turn the cheat off when you are done.",
       cheats: [
@@ -61,6 +62,7 @@ window.PIXELGBA_PRESETS = {
       id: "firered",
       title: "Pokémon FireRed",
       matches: ["firered", "fire red", "pokefirered"],
+      headers: [{ gameCode: "BPRE", revisions: [0] }],
       accent: "#fb923c",
       note: "“PC slot 1” cheats overwrite the first item stack in your PC — withdraw it, then turn the cheat off.",
       cheats: [
@@ -113,6 +115,7 @@ window.PIXELGBA_PRESETS = {
       id: "leafgreen",
       title: "Pokémon LeafGreen",
       matches: ["leafgreen", "leaf green", "pokeleafgreen"],
+      headers: [{ gameCode: "BPGE", revisions: [0] }],
       accent: "#4ade80",
       note: "“PC slot 1” cheats overwrite the first item stack in your PC — withdraw it, then turn the cheat off.",
       cheats: [
@@ -158,6 +161,7 @@ window.PIXELGBA_PRESETS = {
       id: "ruby",
       title: "Pokémon Ruby",
       matches: ["ruby"],
+      headers: [{ gameCode: "AXVE", revisions: [0] }],
       accent: "#f87171",
       note: "Older (pre-Emerald) engine — some codes are less reliable. Enable the master code first if a cheat does nothing.",
       cheats: [
@@ -189,6 +193,7 @@ window.PIXELGBA_PRESETS = {
       id: "sapphire",
       title: "Pokémon Sapphire",
       matches: ["sapphire"],
+      headers: [{ gameCode: "AXPE", revisions: [0] }],
       accent: "#60a5fa",
       note: "Older (pre-Emerald) engine — some codes are less reliable. Enable the master code first if a cheat does nothing.",
       cheats: [
@@ -227,8 +232,22 @@ window.PIXELGBA_PRESETS = {
       .replace(/^-+|-+$/g, "") || "game";
   },
 
-  /** Find a preset game entry for a ROM filename (returns null if none). */
-  match(filename) {
+  /**
+   * Match a preset from the cartridge header when available. Header matches are
+   * deliberately exact by game code and revision: a renamed regional/revised ROM
+   * must not silently receive codes intended for another executable. Filename
+   * matching remains only for old metadata and files without a readable header.
+   */
+  match(filename, header = null) {
+    if (header && /^[A-Z0-9]{4}$/.test(header.gameCode || "")) {
+      for (const game of this.games) {
+        for (const candidate of (game.headers || [])) {
+          if (candidate.gameCode === header.gameCode &&
+              (!candidate.revisions || candidate.revisions.includes(header.revision))) return game;
+        }
+      }
+      return null;
+    }
     const base = String(filename || "")
       .replace(/\.(gba|agb|bin|zip|7z|rom)$/i, "")
       .toLowerCase()

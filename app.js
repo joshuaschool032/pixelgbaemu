@@ -30,7 +30,7 @@
       " " + d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
   };
   const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
-  const baseName = (name) => String(name).replace(/\.(gba|agb|bin|zip|7z|rom)$/i, "");
+  const baseName = (name) => String(name).replace(/\.(gba|agb|bin|zip|7z|rar|rom)$/i, "");
   const PRESETS = window.PIXELGBA_PRESETS;
   const legacyGidOf = (filename) => PRESETS.slug(filename);
 
@@ -55,26 +55,163 @@
     return [a, b, c, d].map((n) => (n >>> 0).toString(16).padStart(8, "0")).join("") + ":" + u8.length;
   }
 
-  const hex = (buffer) => Array.from(new Uint8Array(buffer), (b) => b.toString(16).padStart(2, "0")).join("");
+  const hex = (buffer) => Array.from(new Uint8Array(buffer.buffer || buffer, buffer.byteOffset || 0, buffer.byteLength || undefined), (b) => b.toString(16).padStart(2, "0")).join("");
+  const asBytes = (value) => value instanceof Uint8Array
+    ? value
+    : new Uint8Array(value.buffer || value, value.byteOffset || 0, value.byteLength || undefined);
+  const ownBuffer = (value) => {
+    const bytes = asBytes(value);
+    return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+  };
+  const textDecoder = new TextDecoder();
+  const textEncoder = new TextEncoder();
+
+  async function digestHex(value) {
+    const bytes = asBytes(value);
+    try {
+      if (!window.crypto || !window.crypto.subtle) throw new Error("SubtleCrypto unavailable");
+      return hex(await window.crypto.subtle.digest("SHA-256", ownBuffer(bytes)));
+    } catch (error) {
+      return "fp-" + bytesSig(bytes).replace(":", "-");
+    }
+  }
+
+  async function contentId(value) {
+    const digest = await digestHex(value);
+    return digest.startsWith("fp-") ? digest : "sha256-" + digest;
+  }
 
   const engineGameName = (filename, gid) => {
     const clean = baseName(filename).replace(/[^a-z0-9._ -]+/gi, "_").trim().slice(0, 80) || "game";
     return clean + "-" + gid + ".gba";
   };
 
-  /** Content identity prevents different revisions/hacks with the same filename sharing saves. */
-  async function identifyRom(file) {
-    const buffer = await file.arrayBuffer();
-    let digest;
-    try {
-      if (!window.crypto || !window.crypto.subtle) throw new Error("SubtleCrypto unavailable");
-      digest = "sha256-" + hex(await window.crypto.subtle.digest("SHA-256", buffer));
-    } catch (error) {
-      // file:// and older browsers may not expose SubtleCrypto. The fallback still
-      // reads the complete file and is much safer than a filename-only key.
-      digest = "fp-" + bytesSig(new Uint8Array(buffer)).replace(":", "-");
+  function parseGbaHeader(value) {
+    const bytes = asBytes(value);
+    if (bytes.length < 0xbe) return null;
+    const ascii = (start, length) => textDecoder.decode(bytes.slice(start, start + length)).replace(/[\0\xff]+/g, "").trim();
+    const gameCode = ascii(0xac, 4).toUpperCase();
+    if (!/^[A-Z0-9]{4}$/.test(gameCode)) return null;
+    return {
+      title: ascii(0xa0, 12),
+      gameCode,
+      makerCode: ascii(0xb0, 2).toUpperCase(),
+      revision: bytes[0xbc],
+    };
+  }
+
+  let runtimeBundlePromise = null;
+  function ensureRuntimeBundle() {
+    if (window.EJS_COMPRESSION) return Promise.resolve();
+    if (runtimeBundlePromise) return runtimeBundlePromise;
+    runtimeBundlePromise = new Promise((resolve, reject) => {
+      const script = document.createElement("script");
+      script.src = (window.PIXELGBA_FLAT_PATHS && window.PIXELGBA_FLAT_PATHS["emulator.min.js"]) || "emulator.min.js";
+      script.dataset.pgbaRuntime = "1";
+      script.onload = resolve;
+      script.onerror = () => reject(new Error("Could not load the archive extractor runtime"));
+      document.head.appendChild(script);
+    }).catch((error) => { runtimeBundlePromise = null; throw error; });
+    return runtimeBundlePromise;
+  }
+
+  async function extractWithBundledRuntime(bytes) {
+    await ensureRuntimeBundle();
+    const bridge = {
+      downloadFile: async (path, _progress, _cors, options = {}) => {
+        const filename = String(path).split("/").pop();
+        const mapped = (window.PIXELGBA_FLAT_PATHS && window.PIXELGBA_FLAT_PATHS[filename]) || filename;
+        const response = await fetch(new URL(mapped, location.href));
+        if (!response.ok) return -1;
+        return { data: options.responseType === "text" ? await response.text() : await response.arrayBuffer() };
+      },
+      startGameError(message) { throw new Error(message || "Archive extraction failed"); },
+    };
+    return new window.EJS_COMPRESSION(bridge).decompress(bytes, () => {});
+  }
+
+  async function extractZip(bytes) {
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    let eocd = -1;
+    for (let i = bytes.length - 22; i >= Math.max(0, bytes.length - 65_557); i--) {
+      if (view.getUint32(i, true) === 0x06054b50) { eocd = i; break; }
     }
-    return { gid: digest, legacyGid: legacyGidOf(file.name), buffer };
+    if (eocd < 0) throw new Error("ZIP directory was not found");
+    const count = view.getUint16(eocd + 10, true);
+    let offset = view.getUint32(eocd + 16, true);
+    const candidates = [];
+    for (let index = 0; index < count; index++) {
+      if (view.getUint32(offset, true) !== 0x02014b50) throw new Error("Invalid ZIP directory");
+      const method = view.getUint16(offset + 10, true);
+      const compressedSize = view.getUint32(offset + 20, true);
+      const size = view.getUint32(offset + 24, true);
+      const nameLength = view.getUint16(offset + 28, true);
+      const extraLength = view.getUint16(offset + 30, true);
+      const commentLength = view.getUint16(offset + 32, true);
+      const localOffset = view.getUint32(offset + 42, true);
+      const name = textDecoder.decode(bytes.slice(offset + 46, offset + 46 + nameLength));
+      if (/\.(gba|agb|bin|rom)$/i.test(name) && !name.endsWith("/")) {
+        candidates.push({ name, method, compressedSize, size, localOffset });
+      }
+      offset += 46 + nameLength + extraLength + commentLength;
+    }
+    if (!candidates.length) throw new Error("The archive contains no GBA ROM");
+    candidates.sort((a, b) => b.size - a.size || a.name.localeCompare(b.name));
+    const entry = candidates[0];
+    if (view.getUint32(entry.localOffset, true) !== 0x04034b50) throw new Error("Invalid ZIP entry");
+    const localNameLength = view.getUint16(entry.localOffset + 26, true);
+    const localExtraLength = view.getUint16(entry.localOffset + 28, true);
+    const start = entry.localOffset + 30 + localNameLength + localExtraLength;
+    const compressed = bytes.slice(start, start + entry.compressedSize);
+    let data;
+    if (entry.method === 0) data = compressed;
+    else if (entry.method === 8 && typeof DecompressionStream !== "undefined") {
+      const stream = new Blob([compressed]).stream().pipeThrough(new DecompressionStream("deflate-raw"));
+      data = new Uint8Array(await new Response(stream).arrayBuffer());
+    } else {
+      throw new Error("ZIP compression requires the bundled extractor");
+    }
+    if (entry.size && data.length !== entry.size) throw new Error("ZIP entry size mismatch");
+    return { name: entry.name, data };
+  }
+
+  async function extractArchiveRom(rawBytes, filename) {
+    const isZip = rawBytes[0] === 0x50 && rawBytes[1] === 0x4b;
+    if (isZip) {
+      try { return await extractZip(rawBytes); } catch (error) {
+        console.warn("Native ZIP extraction failed; using bundled extractor", error);
+      }
+    }
+    if (!isZip && !/\.(7z|rar)$/i.test(filename)) return { name: filename, data: rawBytes };
+    const files = await extractWithBundledRuntime(rawBytes);
+    const candidates = Object.entries(files || {})
+      .filter(([name, data]) => /\.(gba|agb|bin|rom)$/i.test(name) && data && asBytes(data).length)
+      .map(([name, data]) => ({ name, data: asBytes(data) }))
+      .sort((a, b) => b.data.length - a.data.length || a.name.localeCompare(b.name));
+    if (!candidates.length) throw new Error("The archive contains no GBA ROM");
+    return candidates[0];
+  }
+
+  /** Hash the extracted cartridge so raw, ZIP, 7z and RAR copies share one identity. */
+  async function identifyRom(file) {
+    const rawBuffer = await file.arrayBuffer();
+    const rawBytes = new Uint8Array(rawBuffer);
+    const extracted = await extractArchiveRom(rawBytes, file.name);
+    const romBytes = asBytes(extracted.data);
+    const gid = await contentId(romBytes);
+    const rawGid = romBytes === rawBytes ? gid : await contentId(rawBytes);
+    const romName = String(extracted.name || file.name).split(/[\\/]/).pop() || "game.gba";
+    const legacyGids = [...new Set([legacyGidOf(file.name), legacyGidOf(romName), rawGid])].filter((id) => id && id !== gid);
+    return {
+      gid,
+      legacyGid: legacyGids[0] || null,
+      legacyGids,
+      buffer: ownBuffer(romBytes),
+      name: romName,
+      sourceName: file.name,
+      header: parseGbaHeader(romBytes),
+      archived: rawBytes.length !== romBytes.length || romName !== file.name,
+    };
   }
 
   /* EmulatorJS asks for a screen wake lock; embedded/preview contexts deny it.
@@ -153,6 +290,11 @@
         delete cache[kind];
       },
       keys: (kind) => tx(kind, "readonly", (s) => s.getAllKeys()),
+      entries: async (kind) => {
+        const keys = await tx(kind, "readonly", (s) => s.getAllKeys());
+        const values = await Promise.all(keys.map((key) => tx(kind, "readonly", (s) => s.get(key))));
+        return keys.map((key, index) => [key, values[index]]);
+      },
       deletePrefix: async (kind, prefix) => {
         const keys = await tx(kind, "readonly", (s) => s.getAllKeys());
         await Promise.all(keys.filter((key) => String(key).startsWith(prefix)).map((key) => tx(kind, "readwrite", (s) => s.delete(key))));
@@ -221,6 +363,11 @@
   const K_CHEATS = (gid) => "pgba.cheats." + gid;
   const K_LASTPRESET = "pgba.lastPreset";
   const K_LASTROM = "pgba.lastRom";
+  const K_LIBRARY_SORT = "pgba.librarySort";
+  const STATE_MAGIC = "PIXELGBA_STATE_V1\n";
+  const BACKUP_FORMAT = "pixelgba-backup-v1";
+  const CORE_ID = "mgba";
+  const EMULATOR_VERSION = "4.2.3";
 
   /* -------------------------------------------------------------- app state */
   const S = {
@@ -239,6 +386,11 @@
     launchId: 0,
     bootTimer: null,
     storageWarned: false,
+    libraryQuery: "",
+    librarySort: store.get(K_LIBRARY_SORT, "recent"),
+    favoritesOnly: false,
+    saveSyncQueue: Promise.resolve(),
+    saveEventHandler: null,
   };
 
   if (!Array.isArray(S.roms)) S.roms = [];
@@ -304,9 +456,10 @@
   };
 
   async function migrateLegacyIdentity(identity, filename) {
-    const oldGid = identity.legacyGid;
     const newGid = identity.gid;
-    if (!oldGid || oldGid === newGid) return;
+    const oldGids = [...new Set(identity.legacyGids || [identity.legacyGid])]
+      .filter((gid) => gid && gid !== newGid);
+    if (!oldGids.length) return;
 
     const moveRecord = async (kind, from, to) => {
       const oldValue = await IDB.get(kind, from).catch(() => null);
@@ -316,35 +469,38 @@
       await IDB.del(kind, from).catch(() => {});
     };
 
-    await moveRecord("saves", oldGid, newGid);
-    await moveRecord("saves", "__rom__" + oldGid, "__rom__" + newGid);
-    const stateKeys = await IDB.keys("states").catch(() => []);
-    for (const key of stateKeys.filter((key) => String(key).startsWith(oldGid + ":"))) {
-      await moveRecord("states", key, newGid + String(key).slice(oldGid.length));
+    for (const oldGid of oldGids) {
+      await moveRecord("saves", oldGid, newGid);
+      await moveRecord("saves", "__rom__" + oldGid, "__rom__" + newGid);
+      const stateKeys = await IDB.keys("states").catch(() => []);
+      for (const key of stateKeys.filter((key) => String(key).startsWith(oldGid + ":"))) {
+        await moveRecord("states", key, newGid + String(key).slice(oldGid.length));
+      }
+
+      const oldCheats = store.raw(K_CHEATS(oldGid));
+      if (oldCheats && !store.raw(K_CHEATS(newGid))) store.setRaw(K_CHEATS(newGid), oldCheats);
+      if (oldCheats) store.del(K_CHEATS(oldGid));
+
+      // EmulatorJS includes EJS_gameID in its per-game settings key. Preserve
+      // controls/settings from filename/archive-keyed versions on first load.
+      const oldEnginePrefix = "ejs-pgba-" + oldGid + "-";
+      for (const key of store.allKeys().filter((key) => key.startsWith(oldEnginePrefix))) {
+        const suffix = key.slice(oldEnginePrefix.length);
+        const core = suffix.split("-")[0] || "gba";
+        const target = "ejs-pgba-" + newGid + "-" + core + "-" + engineGameName(identity.name || filename, newGid) + "-settings";
+        if (!store.raw(target)) store.setRaw(target, store.raw(key));
+        store.del(key);
+      }
     }
 
-    const oldCheats = store.raw(K_CHEATS(oldGid));
-    if (oldCheats && !store.raw(K_CHEATS(newGid))) store.setRaw(K_CHEATS(newGid), oldCheats);
-    if (oldCheats) store.del(K_CHEATS(oldGid));
-
-    // EmulatorJS includes EJS_gameID in its per-game settings key. Preserve
-    // controls/settings from filename-keyed versions when this ROM is first hashed.
-    const oldEnginePrefix = "ejs-pgba-" + oldGid + "-";
-    for (const key of store.allKeys().filter((key) => key.startsWith(oldEnginePrefix))) {
-      const suffix = key.slice(oldEnginePrefix.length);
-      const core = suffix.split("-")[0] || "gba";
-      const target = "ejs-pgba-" + newGid + "-" + core + "-" + engineGameName(filename, newGid) + "-settings";
-      if (!store.raw(target)) store.setRaw(target, store.raw(key));
-      store.del(key);
-    }
-
+    const oldSet = new Set(oldGids);
     S.roms = S.roms
-      .map((rom) => rom.gid === oldGid && rom.name === filename ? { ...rom, gid: newGid } : rom)
+      .map((rom) => oldSet.has(rom.gid) ? { ...rom, gid: newGid, name: identity.name || rom.name, header: identity.header || rom.header } : rom)
       .filter((rom, index, all) => all.findIndex((candidate) => candidate.gid === rom.gid) === index);
     persist(K_ROMS, S.roms, "the ROM library");
 
     const last = store.get(K_LASTROM, null);
-    if (last && last.gid === oldGid) persist(K_LASTROM, { ...last, gid: newGid }, "the last played game");
+    if (last && oldSet.has(last.gid)) persist(K_LASTROM, { ...last, gid: newGid, name: identity.name || last.name, header: identity.header || last.header }, "the last played game");
   }
 
   function seedPresetCheats(gid, presetId) {
@@ -357,21 +513,43 @@
      LIBRARY — ROM list rendered from localStorage metadata
      ===================================================================== */
   function renderLibrary() {
-    S.roms.sort((a, b) => (b.lastPlayed || 0) - (a.lastPlayed || 0));
+    const query = S.libraryQuery.trim().toLowerCase();
+    const filtered = S.roms.filter((rom) => {
+      const haystack = [rom.name, rom.header && rom.header.title, rom.header && rom.header.gameCode].filter(Boolean).join(" ").toLowerCase();
+      return (!query || haystack.includes(query)) && (!S.favoritesOnly || rom.favorite);
+    });
+    const sorted = filtered.slice().sort((a, b) => {
+      if (S.librarySort === "title") return baseName(a.name).localeCompare(baseName(b.name), undefined, { sensitivity: "base" });
+      if (S.librarySort === "added") return (b.addedAt || b.lastPlayed || 0) - (a.addedAt || a.lastPlayed || 0);
+      return (b.lastPlayed || 0) - (a.lastPlayed || 0);
+    });
     const list = $("#recentList");
-    $("#romCount").textContent = String(S.roms.length);
+    $("#romCount").textContent = sorted.length === S.roms.length ? String(S.roms.length) : sorted.length + "/" + S.roms.length;
     list.innerHTML = "";
-    for (const rom of S.roms) {
+    if (!sorted.length) {
+      list.innerHTML = '<div class="empty-state">' + (S.roms.length ? "No games match this filter." : "Your locally cached games appear here.") + "</div>";
+      return;
+    }
+    for (const rom of sorted) {
       const row = document.createElement("div");
       row.className = "recent-item";
+      const headerMeta = rom.header && rom.header.gameCode
+        ? " · " + esc(rom.header.gameCode) + " rev " + Number(rom.header.revision || 0)
+        : "";
       row.innerHTML =
+        '<button type="button" class="r-favorite" aria-pressed="' + String(!!rom.favorite) + '" aria-label="' + (rom.favorite ? "Remove " : "Add ") + esc(baseName(rom.name)) + ' ' + (rom.favorite ? "from favorites" : "to favorites") + '" title="Favorite">' + (rom.favorite ? "★" : "☆") + "</button>" +
         '<button type="button" class="r-play" title="Play ' + esc(rom.name) + '">' +
         '<span class="r-ico" aria-hidden="true">GBA</span>' +
         '<span class="r-copy"><span class="r-name">' + esc(baseName(rom.name)) + "</span>" +
-        '<span class="r-meta">' + fmtBytes(rom.size) + " · " + fmtWhen(rom.lastPlayed) +
+        '<span class="r-meta">' + fmtBytes(rom.size) + " · " + fmtWhen(rom.lastPlayed) + headerMeta +
         (rom.cached === false ? " · file not cached" : "") + "</span></span></button>" +
         '<button type="button" class="r-del" aria-label="Remove ' + esc(baseName(rom.name)) + ' from library" title="Remove from library; saves are kept">×</button>' +
         '<button type="button" class="r-purge" aria-label="Delete ' + esc(baseName(rom.name)) + ' and all local data" title="Delete game and all local data">🗑</button>';
+      $(".r-favorite", row).addEventListener("click", () => {
+        rom.favorite = !rom.favorite;
+        persist(K_ROMS, S.roms, "the ROM library");
+        renderLibrary();
+      });
       $(".r-play", row).addEventListener("click", () => launchStoredRom(rom));
       $(".r-del", row).addEventListener("click", async () => {
         S.roms = S.roms.filter((r) => r.gid !== rom.gid);
@@ -398,9 +576,20 @@
   }
 
   async function rememberRom(file, identity) {
-    const rec = { name: file.name, gid: identity.gid, size: file.size, lastPlayed: Date.now(), cached: true };
+    const previous = S.roms.find((rom) => rom.gid === identity.gid);
+    const rec = {
+      name: identity.name || file.name,
+      sourceName: identity.sourceName || file.name,
+      gid: identity.gid,
+      size: identity.buffer.byteLength,
+      lastPlayed: Date.now(),
+      addedAt: previous?.addedAt || Date.now(),
+      favorite: !!previous?.favorite,
+      header: identity.header || null,
+      cached: true,
+    };
     try {
-      await IDB.put("saves", "__rom__" + identity.gid, { data: identity.buffer, name: file.name, at: Date.now() });
+      await IDB.put("saves", "__rom__" + identity.gid, { data: identity.buffer, name: rec.name, sourceName: rec.sourceName, header: rec.header, at: Date.now() });
     } catch (error) {
       rec.cached = false;
       console.warn("Could not cache ROM blob", error);
@@ -477,6 +666,22 @@
   }
 
   /* ---- input wiring ---- */
+  $("#librarySearch").addEventListener("input", (event) => {
+    S.libraryQuery = event.target.value;
+    renderLibrary();
+  });
+  $("#librarySort").value = ["recent", "title", "added"].includes(S.librarySort) ? S.librarySort : "recent";
+  $("#librarySort").addEventListener("change", (event) => {
+    S.librarySort = event.target.value;
+    persist(K_LIBRARY_SORT, S.librarySort, "the library sort order");
+    renderLibrary();
+  });
+  $("#libraryFavorites").addEventListener("click", (event) => {
+    S.favoritesOnly = !S.favoritesOnly;
+    event.currentTarget.setAttribute("aria-pressed", String(S.favoritesOnly));
+    event.currentTarget.classList.toggle("is-active", S.favoritesOnly);
+    renderLibrary();
+  });
   $("#romInput").addEventListener("change", (e) => {
     const f = e.target.files && e.target.files[0];
     e.target.value = "";
@@ -531,8 +736,8 @@
     const f = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
     if (!f) return;
     e.preventDefault();
-    if (!/\.(gba|agb|bin|zip|7z)$/i.test(f.name)) {
-      toast("That's not a GBA ROM — expected .gba / .agb / .bin / .zip", "error");
+    if (!/\.(gba|agb|bin|zip|7z|rar)$/i.test(f.name)) {
+      toast("That's not a GBA ROM — expected .gba / .agb / .bin / .zip / .7z / .rar", "error");
       return;
     }
     startGame(f);
@@ -573,7 +778,7 @@
       toast("Can't run from file:// — double-click serve.bat (Windows) or run ./serve.sh, then open http://localhost:8080", "error", 9000);
       return;
     }
-    const ok = /\.(gba|agb|bin|zip|7z)$/i.test(file.name || "");
+    const ok = /\.(gba|agb|bin|zip|7z|rar)$/i.test(file.name || "");
     if (!ok) { toast("Please choose a .gba ROM file", "error"); return; }
 
     S.starting = true;
@@ -594,8 +799,19 @@
     if (launchId !== S.launchId) return;
     S.starting = true;
     await migrateLegacyIdentity(identity, file.name).catch((error) => console.warn("Legacy storage migration failed", error));
+    const romFile = new File([identity.buffer], identity.name || file.name, {
+      type: "application/octet-stream",
+      lastModified: file.lastModified || Date.now(),
+    });
 
-    S.current = { name: file.name, gid: identity.gid, size: file.size, lastPlayed: Date.now() };
+    S.current = {
+      name: romFile.name,
+      sourceName: file.name,
+      gid: identity.gid,
+      size: identity.buffer.byteLength,
+      lastPlayed: Date.now(),
+      header: identity.header || null,
+    };
     S.lastSaveSig = null;
     S.savedSave = null;
     S.savedSaveAt = 0;
@@ -603,7 +819,7 @@
 
     // Preselect the matching Pokémon preset and carry over cheats configured
     // before the ROM was loaded.
-    const match = PRESETS.match(file.name);
+    const match = PRESETS.match(romFile.name, identity.header);
     if (match) {
       S.presetId = match.id;
       persist(K_LASTPRESET, match.id, "the selected cheat preset");
@@ -615,17 +831,17 @@
 
     boot.hide();
     pill("Loading engine…", true);
-    $("#toolbarHint").textContent = "Booting " + baseName(file.name) + "…";
+    $("#toolbarHint").textContent = "Booting " + baseName(romFile.name) + "…";
     renderSaves(); renderCheats();
 
     /* --- EmulatorJS globals (read by loader.js) --- */
     window.EJS_player = "#game";
     window.EJS_core = "mgba";
     window.EJS_pathtodata = ENGINE.dataPath;
-    window.EJS_gameUrl = file;
+    window.EJS_gameUrl = romFile;
     // The core derives its IDBFS save path from gameName. Include the content ID so
     // same-named revisions cannot collide in EmulatorJS's own filesystem either.
-    window.EJS_gameName = engineGameName(file.name, S.current.gid);
+    window.EJS_gameName = engineGameName(romFile.name, S.current.gid);
     const expectedGameId = "pgba-" + S.current.gid;
     window.EJS_gameID = expectedGameId;
     window.EJS_biosUrl = "";
@@ -679,6 +895,12 @@
           origToggle(dontUpdate);
           if (emu.paused) syncSaveNow().catch(() => {});
         };
+        // EmulatorJS emits this whenever the core flushes SRAM. Polling remains a
+        // fallback, while this hook persists normal in-game saves immediately.
+        S.saveEventHandler = (bytes) => {
+          if (!S.saveFlushInProgress) syncSaveNow({ fromEvent: true, bytes }).catch(() => {});
+        };
+        emu.on && emu.on("saveSaveFiles", S.saveEventHandler);
         // theme the emulator menu bar to match PixelGBA
         emu.setColor && emu.setColor("#8b7bff");
       } catch (e) { console.warn(e); }
@@ -695,14 +917,14 @@
       S.running = true;
       S.starting = false;
       boot.hide();
-      pill("Playing · " + baseName(file.name), false);
-      $("#toolbarHint").textContent = baseName(file.name) + " · " + fmtBytes(file.size);
+      pill("Playing · " + baseName(romFile.name), false);
+      $("#toolbarHint").textContent = baseName(romFile.name) + " · " + fmtBytes(identity.buffer.byteLength);
       restoreBatterySave().then(() => {
         if (launchId === S.launchId) applyEnabledCheats();
       });
       startSavePoll();
       renderLibrary(); renderSaves(); renderCheats(); renderBootHint();
-      toast("Loaded " + baseName(file.name), "success");
+      toast("Loaded " + baseName(romFile.name), "success");
     };
 
     try {
@@ -752,6 +974,8 @@
       try { emu.setVolume(0); } catch (e) {}
       try { emu.pause(true); } catch (e) {}
       try { emu.gamepad && emu.gamepad.terminate && emu.gamepad.terminate(); } catch (e) {}
+      try { if (S.saveEventHandler && emu.off) emu.off("saveSaveFiles", S.saveEventHandler); } catch (e) {}
+      S.saveEventHandler = null;
       try {
         if (shouldExit && emu.callEvent) emu.callEvent("exit");
         else if (emu.gameManager) emu.gameManager.toggleMainLoop(0);
@@ -901,12 +1125,22 @@
     try { return gm.getSaveFilePath(); } catch (e) { return null; }
   }
 
-  async function syncSaveNow({ force = false } = {}) {
+  async function performSaveSync({ force = false, fromEvent = false, bytes: suppliedBytes = null } = {}) {
     const gm = gameManager();
     const current = S.current;
     if (!gm || !S.running || !current) return;
-    let bytes;
-    try { bytes = gm.getSaveFile(); } catch (e) { return; }
+    let bytes = suppliedBytes ? asBytes(suppliedBytes) : null;
+    try {
+      if (!fromEvent) {
+        S.saveFlushInProgress = true;
+        gm.saveSaveFiles && gm.saveSaveFiles();
+      }
+      if (!bytes || !bytes.length) bytes = gm.getSaveFile(false);
+    } catch (e) {
+      return;
+    } finally {
+      S.saveFlushInProgress = false;
+    }
     if (!bytes || !bytes.length) return;
     const sig = bytesSig(bytes);
     if (!force && sig === S.lastSaveSig) return;
@@ -915,7 +1149,28 @@
     let enginePath = null;
     try { enginePath = gm.getSaveFilePath(); } catch (e) {}
     try {
-      await IDB.put("saves", current.gid, { data: copy.buffer, at: savedAt, name: current.name, enginePath });
+      const previous = await IDB.get("saves", current.gid).catch(() => null);
+      const previousSig = previous && previous.data ? (previous.sig || bytesSig(new Uint8Array(previous.data))) : null;
+      if (sig === previousSig) {
+        if (S.current && S.current.gid === current.gid) {
+          S.lastSaveSig = sig;
+          S.savedSave = copy;
+          S.savedSaveAt = previous.at || savedAt;
+          renderSavPanel();
+        }
+        return;
+      }
+      const history = previous && previous.data
+        ? [{ data: previous.data, at: previous.at || savedAt, sig: previousSig }, ...(previous.history || [])].slice(0, 2)
+        : [];
+      await IDB.put("saves", current.gid, {
+        data: copy.buffer,
+        at: savedAt,
+        name: current.name,
+        enginePath,
+        sig,
+        history,
+      });
       if (S.current && S.current.gid === current.gid) {
         S.lastSaveSig = sig;
         S.savedSave = copy;
@@ -925,7 +1180,15 @@
     } catch (e) {
       console.warn("save sync failed", e);
       toast("Battery save could not be persisted — export it before closing this page", "error", 7000);
+      throw e;
     }
+  }
+
+  function syncSaveNow(options = {}) {
+    // Serialize reads/writes so a core event, poll and visibility flush cannot race
+    // and overwrite a newer save with an older snapshot.
+    S.saveSyncQueue = S.saveSyncQueue.catch(() => {}).then(() => performSaveSync(options));
+    return S.saveSyncQueue;
   }
 
   async function restoreBatterySave() {
@@ -1006,7 +1269,11 @@
     } catch (e) {}
     const rec = {
       data: state.buffer.slice(state.byteOffset, state.byteOffset + state.byteLength),
-      thumb, at: Date.now(), size: state.byteLength, name: S.current.name,
+      thumb,
+      at: Date.now(),
+      size: state.byteLength,
+      name: S.current.name,
+      metadata: { gameId: S.current.gid, core: CORE_ID, emulatorVersion: EMULATOR_VERSION, romHeader: S.current.header || null },
     };
     try {
       await IDB.put("states", stateKey(slot), rec);
@@ -1046,6 +1313,41 @@
       fr.readAsDataURL(blob);
     });
   }
+  async function packStateFile(data, metadata = {}) {
+    const bytes = asBytes(data);
+    const header = {
+      format: "pixelgba-state-v1",
+      gameId: metadata.gameId,
+      romName: metadata.romName || "game.gba",
+      romHeader: metadata.romHeader || null,
+      core: CORE_ID,
+      emulatorVersion: EMULATOR_VERSION,
+      createdAt: metadata.createdAt || Date.now(),
+      byteLength: bytes.length,
+      sha256: await digestHex(bytes),
+    };
+    return new Blob([STATE_MAGIC, JSON.stringify(header), "\n", bytes], { type: "application/x-pixelgba-state" });
+  }
+
+  async function unpackStateFile(buffer) {
+    const bytes = asBytes(buffer);
+    const magic = textEncoder.encode(STATE_MAGIC);
+    const wrapped = bytes.length > magic.length && magic.every((value, index) => bytes[index] === value);
+    if (!wrapped) return { data: ownBuffer(bytes), metadata: null, wrapped: false };
+    let newline = -1;
+    for (let index = magic.length; index < Math.min(bytes.length, magic.length + 65_536); index++) {
+      if (bytes[index] === 10) { newline = index; break; }
+    }
+    if (newline < 0) throw new Error("State metadata is incomplete");
+    let metadata;
+    try { metadata = JSON.parse(textDecoder.decode(bytes.slice(magic.length, newline))); }
+    catch (error) { throw new Error("State metadata is invalid"); }
+    const data = bytes.slice(newline + 1);
+    if (metadata.format !== "pixelgba-state-v1" || metadata.byteLength !== data.length) throw new Error("State length does not match its metadata");
+    if (metadata.sha256 !== await digestHex(data)) throw new Error("State checksum does not match");
+    return { data: ownBuffer(data), metadata, wrapped: true };
+  }
+
   async function exportLatestState() {
     if (!S.current) { toast("No game loaded", "warn"); return; }
     const keys = await IDB.keys("states").catch(() => []);
@@ -1056,9 +1358,14 @@
       const rec = await IDB.get("states", k);
       if (rec && (!bestRec || rec.at > bestRec.at)) { best = k; bestRec = rec; }
     }
-    const blob = new Blob([bestRec.data], { type: "application/octet-stream" });
-    downloadBlob(blob, baseName(S.current.name) + "-slot" + String(best).split(":")[1] + ".state");
-    toast("Exported latest state", "success");
+    const blob = await packStateFile(bestRec.data, {
+      gameId: S.current.gid,
+      romName: S.current.name,
+      romHeader: S.current.header,
+      createdAt: bestRec.at,
+    });
+    downloadBlob(blob, baseName(S.current.name) + "-slot" + String(best).split(":")[1] + ".pgstate");
+    toast("Exported validated PixelGBA state", "success");
   }
 
   async function importStateFile(file) {
@@ -1071,25 +1378,42 @@
       toast("All five slots are occupied — delete a slot before importing", "warn", 6000);
       return;
     }
-    let buf;
-    try { buf = await file.arrayBuffer(); } catch (error) {
-      toast("Could not read that state file", "error");
+    let parsed;
+    try {
+      const buf = await file.arrayBuffer();
+      if (!buf.byteLength || buf.byteLength > 64 * 1024 * 1024) throw new Error("State file size is invalid");
+      parsed = await unpackStateFile(buf);
+    } catch (error) {
+      toast(error.message || "Could not read that state file", "error", 6000);
       return;
     }
-    if (!buf.byteLength || buf.byteLength > 64 * 1024 * 1024) {
-      toast("That doesn't look like a valid save-state file", "error");
-      return;
+    if (parsed.metadata) {
+      if (parsed.metadata.gameId !== current.gid) {
+        toast("That state belongs to a different ROM; no slot was changed", "error", 6500);
+        return;
+      }
+      if (parsed.metadata.core !== CORE_ID || parsed.metadata.emulatorVersion !== EMULATOR_VERSION) {
+        toast("That state was created by an incompatible core version; no slot was changed", "error", 6500);
+        return;
+      }
     }
     try {
-      emulator().gameManager.loadState(new Uint8Array(buf));
+      emulator().gameManager.loadState(new Uint8Array(parsed.data));
     } catch (error) {
       toast("That state is corrupt or incompatible; no slot was changed", "error", 6000);
       return;
     }
-    const rec = { data: buf, thumb: "", at: Date.now(), size: buf.byteLength, name: file.name };
+    const rec = {
+      data: parsed.data,
+      thumb: "",
+      at: Date.now(),
+      size: parsed.data.byteLength,
+      name: file.name,
+      metadata: parsed.metadata,
+    };
     try {
       await IDB.put("states", current.gid + ":" + free, rec);
-      toast("State imported into slot " + free + " and loaded", "success");
+      toast("State imported into slot " + free + " and loaded" + (parsed.wrapped ? " (checksum verified)" : " (legacy raw state)"), "success");
       renderSaves();
     } catch (error) {
       toast("The state loaded, but browser storage could not save it", "error", 6000);
@@ -1221,7 +1545,7 @@
     // preset pills
     const picker = $("#presetGames");
     picker.innerHTML = "";
-    const matched = S.current ? PRESETS.match(S.current.name) : null;
+    const matched = S.current ? PRESETS.match(S.current.name, S.current.header) : null;
     const activeId = S.presetId || (matched && matched.id) || "emerald";
     for (const g of PRESETS.games) {
       const b = document.createElement("button");
@@ -1238,7 +1562,10 @@
     }
 
     const game = PRESETS.games.find((g) => g.id === activeId) || PRESETS.games[0];
-    $("#presetNote").textContent = game.note || "";
+    const mismatchNote = S.current && S.current.header && !matched
+      ? "No preset exactly matches cartridge " + S.current.header.gameCode + " revision " + S.current.header.revision + ". Presets below are manual and may be incompatible. "
+      : "";
+    $("#presetNote").textContent = mismatchNote + (game.note || "");
 
     const plist = $("#presetList");
     plist.innerHTML = "";
@@ -1410,7 +1737,11 @@
       if (buf.byteLength < 512 || buf.byteLength > 16 * 1024 * 1024) { toast("That doesn't look like a .sav file", "error"); return; }
       const current = S.current;
       try {
-        await IDB.put("saves", current.gid, { data: buf, at: Date.now(), name: current.name, enginePath: S.running ? saveFilePath() : null });
+        const existing = await IDB.get("saves", current.gid).catch(() => null);
+        const history = existing && existing.data
+          ? [{ data: existing.data, at: existing.at || Date.now(), sig: existing.sig || bytesSig(new Uint8Array(existing.data)) }, ...(existing.history || [])].slice(0, 2)
+          : [];
+        await IDB.put("saves", current.gid, { data: buf, at: Date.now(), name: current.name, enginePath: S.running ? saveFilePath() : null, sig: bytesSig(new Uint8Array(buf)), history });
         if (!S.current || S.current.gid !== current.gid) return;
         S.savedSave = new Uint8Array(buf);
         S.savedSaveAt = Date.now();
@@ -1424,6 +1755,35 @@
     });
   }
   wireSavImport(["#btnImportSav", "#btnQuickImportSav"], "#savInput");
+
+  $("#btnRestoreSav").addEventListener("click", async () => {
+    if (!S.current) { toast("Load a game first", "warn"); return; }
+    await syncSaveNow({ force: true }).catch(() => {});
+    const current = S.current;
+    const rec = await IDB.get("saves", current.gid).catch(() => null);
+    const previous = rec && rec.history && rec.history[0];
+    if (!previous || !previous.data) { toast("No previous automatic save copy is available yet", "warn", 5000); return; }
+    if (!confirm("Restore the previous battery save from " + fmtWhen(previous.at) + "? The current save will remain as a rolling backup.")) return;
+    const currentCopy = { data: rec.data, at: rec.at, sig: rec.sig || bytesSig(new Uint8Array(rec.data)) };
+    const restored = {
+      ...rec,
+      data: previous.data,
+      at: Date.now(),
+      sig: previous.sig || bytesSig(new Uint8Array(previous.data)),
+      history: [currentCopy, ...(rec.history || []).slice(1)].slice(0, 2),
+    };
+    try {
+      await IDB.put("saves", current.gid, restored);
+      S.savedSave = new Uint8Array(restored.data);
+      S.savedSaveAt = restored.at;
+      S.lastSaveSig = restored.sig;
+      if (S.running) await restoreBatterySave();
+      renderSavPanel();
+      toast("Previous battery save restored", "success");
+    } catch (error) {
+      toast("Could not restore the previous save", "error");
+    }
+  });
 
   $("#btnDeleteSav").addEventListener("click", async () => {
     if (!S.current) return;
@@ -1446,6 +1806,144 @@
     const f = e.target.files && e.target.files[0];
     e.target.value = "";
     if (f) importStateFile(f);
+  });
+
+  function bytesToBase64(value) {
+    const bytes = asBytes(value);
+    let binary = "";
+    for (let offset = 0; offset < bytes.length; offset += 0x8000) {
+      binary += String.fromCharCode(...bytes.subarray(offset, offset + 0x8000));
+    }
+    return btoa(binary);
+  }
+
+  function base64ToBytes(value) {
+    const binary = atob(value);
+    const bytes = new Uint8Array(binary.length);
+    for (let index = 0; index < binary.length; index++) bytes[index] = binary.charCodeAt(index);
+    return bytes;
+  }
+
+  async function encodeBackupValue(value) {
+    const isBuffer = Object.prototype.toString.call(value) === "[object ArrayBuffer]";
+    if (isBuffer || ArrayBuffer.isView(value)) {
+      const bytes = asBytes(value);
+      return { __pixelgbaBytes: bytesToBase64(bytes), byteLength: bytes.length, sha256: await digestHex(bytes) };
+    }
+    if (Array.isArray(value)) return Promise.all(value.map(encodeBackupValue));
+    if (value && typeof value === "object") {
+      const result = {};
+      for (const [key, child] of Object.entries(value)) result[key] = await encodeBackupValue(child);
+      return result;
+    }
+    return value;
+  }
+
+  async function decodeBackupValue(value, depth = 0) {
+    if (depth > 12) throw new Error("Backup nesting is invalid");
+    if (value && typeof value === "object" && typeof value.__pixelgbaBytes === "string") {
+      const bytes = base64ToBytes(value.__pixelgbaBytes);
+      if (bytes.length !== value.byteLength || await digestHex(bytes) !== value.sha256) throw new Error("A backup binary checksum does not match");
+      return ownBuffer(bytes);
+    }
+    if (Array.isArray(value)) return Promise.all(value.map((child) => decodeBackupValue(child, depth + 1)));
+    if (value && typeof value === "object") {
+      const result = {};
+      for (const [key, child] of Object.entries(value)) result[key] = await decodeBackupValue(child, depth + 1);
+      return result;
+    }
+    return value;
+  }
+
+  async function createBackupDocument() {
+    if (S.running) await syncSaveNow({ force: true }).catch(() => {});
+    const local = store.allKeys()
+      .filter((key) => key.startsWith("pgba.") || key.startsWith("ejs-pgba-") || key === "ejs-settings")
+      .map((key) => [key, store.raw(key)]);
+    const saves = [];
+    for (const [key, value] of await IDB.entries("saves").catch(() => [])) saves.push([String(key), await encodeBackupValue(value)]);
+    const states = [];
+    for (const [key, value] of await IDB.entries("states").catch(() => [])) states.push([String(key), await encodeBackupValue(value)]);
+    const payload = { schema: 1, appVersion: "1.2.0", local, saves, states };
+    const payloadText = JSON.stringify(payload);
+    return {
+      format: BACKUP_FORMAT,
+      createdAt: Date.now(),
+      payloadSha256: await digestHex(textEncoder.encode(payloadText)),
+      payload,
+    };
+  }
+
+  async function validateBackupDocument(documentValue) {
+    if (!documentValue || documentValue.format !== BACKUP_FORMAT || !documentValue.payload) throw new Error("This is not a PixelGBA backup");
+    const payloadText = JSON.stringify(documentValue.payload);
+    if (documentValue.payloadSha256 !== await digestHex(textEncoder.encode(payloadText))) throw new Error("The backup manifest checksum does not match");
+    const payload = documentValue.payload;
+    if (payload.schema !== 1 || !Array.isArray(payload.local) || !Array.isArray(payload.saves) || !Array.isArray(payload.states)) throw new Error("The backup schema is unsupported");
+    if (payload.local.length + payload.saves.length + payload.states.length > 10_000) throw new Error("The backup contains too many records");
+    const safeLocal = payload.local.map(([key, raw]) => {
+      if (typeof key !== "string" || typeof raw !== "string" || !(key.startsWith("pgba.") || key.startsWith("ejs-pgba-") || key === "ejs-settings")) throw new Error("The backup contains an unsafe settings key");
+      return [key, raw];
+    });
+    const decodeEntries = async (entries) => {
+      const output = [];
+      for (const entry of entries) {
+        if (!Array.isArray(entry) || typeof entry[0] !== "string" || entry[0].length > 256) throw new Error("The backup contains an invalid database key");
+        output.push([entry[0], await decodeBackupValue(entry[1])]);
+      }
+      return output;
+    };
+    return { local: safeLocal, saves: await decodeEntries(payload.saves), states: await decodeEntries(payload.states) };
+  }
+
+  async function exportFullBackup() {
+    try {
+      const backup = await createBackupDocument();
+      downloadBlob(new Blob([JSON.stringify(backup)], { type: "application/json" }), "pixelgba-backup-" + tsName() + ".pgbackup");
+      toast("Full backup exported with checksums", "success");
+    } catch (error) {
+      console.warn("backup export failed", error);
+      toast("Could not export the full backup", "error", 6000);
+    }
+  }
+
+  async function restoreFullBackup(file) {
+    if (!file || file.size > 768 * 1024 * 1024) { toast("That backup is too large to restore safely", "error"); return; }
+    let decoded;
+    try {
+      decoded = await validateBackupDocument(JSON.parse(await file.text()));
+    } catch (error) {
+      toast(error.message || "That backup is invalid", "error", 7000);
+      return;
+    }
+    if (!confirm("Restore this verified PixelGBA backup? Current PixelGBA ROMs, saves, states, cheats and settings on this site will be replaced.")) return;
+    try {
+      await stopGame({ silent: true });
+      await deleteOwnedEngineFilesystem();
+      store.allKeys()
+        .filter((key) => key.startsWith("pgba.") || key.startsWith("ejs-pgba-") || key === "ejs-settings")
+        .forEach((key) => store.del(key));
+      await IDB.clear("saves");
+      await IDB.clear("states");
+      for (const [key, raw] of decoded.local) {
+        if (!store.setRaw(key, raw)) throw new Error("Browser settings storage is full");
+      }
+      for (const [key, value] of decoded.saves) await IDB.put("saves", key, value);
+      for (const [key, value] of decoded.states) await IDB.put("states", key, value);
+      toast("Backup restored — reloading…", "success");
+      setTimeout(() => location.reload(), 800);
+    } catch (error) {
+      console.warn("backup restore failed", error);
+      toast("Restore stopped because browser storage rejected a record. Keep the backup file and free site storage before retrying.", "error", 9000);
+    }
+  }
+
+  $("#btnExportBackup").addEventListener("click", exportFullBackup);
+  $("#btnImportBackup").addEventListener("click", () => $("#backupInput").click());
+  $("#backupInput").addEventListener("change", (event) => {
+    const file = event.target.files && event.target.files[0];
+    event.target.value = "";
+    if (file) restoreFullBackup(file);
   });
 
   /* ========================================================================
@@ -1491,7 +1989,32 @@
      ===================================================================== */
   activateTab(tabs.find((tab) => tab.classList.contains("is-active")) || tabs[0]);
   if ("serviceWorker" in navigator && /^https?:$/.test(location.protocol)) {
-    navigator.serviceWorker.register(new URL("sw.js", location.href)).catch((error) => console.warn("Offline cache registration failed", error));
+    let waitingWorker = null;
+    let applyingUpdate = false;
+    const showUpdate = (worker) => {
+      waitingWorker = worker;
+      $("#updateBanner").hidden = false;
+    };
+    navigator.serviceWorker.addEventListener("controllerchange", () => {
+      if (applyingUpdate) location.reload();
+    });
+    $("#btnApplyUpdate").addEventListener("click", () => {
+      if (!waitingWorker) return;
+      applyingUpdate = true;
+      waitingWorker.postMessage({ type: "SKIP_WAITING" });
+    });
+    $("#updateClose").addEventListener("click", () => { $("#updateBanner").hidden = true; });
+    navigator.serviceWorker.register(new URL("sw.js", location.href)).then((registration) => {
+      if (registration.waiting) showUpdate(registration.waiting);
+      registration.addEventListener("updatefound", () => {
+        const worker = registration.installing;
+        if (!worker) return;
+        worker.addEventListener("statechange", () => {
+          if (worker.state === "installed" && navigator.serviceWorker.controller) showUpdate(worker);
+        });
+      });
+      registration.update().catch(() => {});
+    }).catch((error) => console.warn("Offline cache registration failed", error));
   }
   renderLibrary();
   renderSaves();
@@ -1524,10 +2047,16 @@
     validateCode,
     normalizeCode,
     identifyRom,
+    parseGbaHeader,
+    packStateFile,
+    unpackStateFile,
+    createBackupDocument,
+    validateBackupDocument,
     bytesSig,
     nextFreeSlot,
     renderLibrary,
     deleteGameData,
-    version: "1.1.0",
+    storage: IDB,
+    version: "1.2.0",
   };
 })();

@@ -80,7 +80,7 @@
                     <span class="pix">PIXEL</span><span class="gb">GBA</span>
                   </div>
                   <p class="boot-title">Drop in a Game Boy Advance ROM</p>
-                  <p class="boot-sub">Supports <b>.gba</b> · .agb · .bin · zipped ROMs</p>
+                  <p class="boot-sub">Supports <b>.gba</b> · .agb · .bin · .zip · .7z · .rar</p>
                   <div class="boot-actions">
                     <button type="button" class="btn btn-primary" id="bootBrowse">
                       <svg viewBox="0 0 24 24" class="ico"><path d="M12 16V4m0 0-4 4m4-4 4 4M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2" stroke="currentColor" stroke-width="1.7" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
@@ -132,13 +132,22 @@
             <span class="count" id="romCount">0</span>
           </div>
           <div class="dropzone" id="dropZone" role="button" tabindex="0" aria-describedby="dropHelp">
-            <input type="file" id="romInput" accept=".gba,.agb,.bin,.zip,.7z,application/octet-stream" hidden />
+            <input type="file" id="romInput" accept=".gba,.agb,.bin,.zip,.7z,.rar,application/octet-stream" hidden />
             <svg viewBox="0 0 24 24" class="drop-ico"><path d="M12 16V4m0 0-4 4m4-4 4 4" stroke="currentColor" stroke-width="1.7" fill="none" stroke-linecap="round" stroke-linejoin="round"/><path d="M4 15v3a3 3 0 0 0 3 3h10a3 3 0 0 0 3-3v-3" stroke="currentColor" stroke-width="1.7" fill="none" stroke-linecap="round"/></svg>
             <span class="drop-main">Drop a <b>.gba</b> ROM here</span>
             <span class="drop-sub" id="dropHelp">or click to browse — files stay on your PC</span>
           </div>
+          <div class="library-tools" role="search" aria-label="Filter game library">
+            <label class="library-search"><span class="sr-only">Search games</span><input type="search" id="librarySearch" placeholder="Search games…" autocomplete="off" /></label>
+            <label><span class="sr-only">Sort games</span><select id="librarySort" aria-label="Sort games">
+              <option value="recent">Recently played</option>
+              <option value="title">Title</option>
+              <option value="added">Recently added</option>
+            </select></label>
+            <button type="button" class="btn btn-ghost btn-sm" id="libraryFavorites" aria-pressed="false" title="Show favorites only">★ Favorites</button>
+          </div>
           <div class="recent" id="recentList" aria-label="Your ROM library"></div>
-          <p class="tiny muted library-note">× removes only the library entry; 🗑 deletes the game and all of its local data.</p>
+          <p class="tiny muted library-note">★ marks a favorite; × removes only the library entry; 🗑 deletes the game and all of its local data.</p>
           <div class="panel-actions">
             <button type="button" class="btn btn-ghost btn-sm" id="btnQuickImportSav" title="Load a .sav battery file for the selected game">Import .sav</button>
             <button type="button" class="btn btn-ghost btn-sm" id="btnQuickLoadState" title="Load a save state file">Load state</button>
@@ -233,7 +242,7 @@
         <div class="mini-actions">
           <button type="button" class="btn btn-ghost btn-sm" id="btnImportState">Import state file…</button>
           <button type="button" class="btn btn-ghost btn-sm" id="btnExportState">Export latest…</button>
-          <input type="file" id="stateInput" accept=".state,application/octet-stream" hidden />
+          <input type="file" id="stateInput" accept=".pgstate,.state,application/x-pixelgba-state,application/octet-stream" hidden />
         </div>
       </div>
 
@@ -255,6 +264,7 @@
         <div class="mini-actions">
           <button type="button" class="btn btn-ghost btn-sm" id="btnExportSav">Export .sav</button>
           <button type="button" class="btn btn-ghost btn-sm" id="btnImportSav">Import .sav</button>
+          <button type="button" class="btn btn-ghost btn-sm" id="btnRestoreSav" title="Restore the previous automatic save copy">Restore previous</button>
           <button type="button" class="btn btn-ghost btn-sm btn-danger" id="btnDeleteSav">Delete stored .sav</button>
           <input type="file" id="savInput" accept=".sav,.dsv,.bin,application/octet-stream" hidden />
         </div>
@@ -283,7 +293,7 @@
 
         <h3 class="panel-title">ROM not loading?</h3>
         <ul class="tips">
-          <li>Only <code>.gba</code>, <code>.agb</code>, <code>.bin</code> and zipped copies are supported — this is a GBA emulator, not a DS or SNES one.</li>
+          <li><code>.gba</code>, <code>.agb</code>, <code>.bin</code>, <code>.zip</code>, <code>.7z</code> and <code>.rar</code> copies are supported — this is a GBA emulator, not a DS or SNES one.</li>
           <li>If the screen stays black, try unzipping the ROM first.</li>
           <li>Extremely large (32 MB+) patched ROM hacks are fine; the engine caches them in your browser's storage after the first load.</li>
         </ul>
@@ -320,9 +330,16 @@ B505DB41 6E39EA4E</pre><p class="tiny muted">8 + 4 hex digits (some CB codes are
       <div class="panel">
         <h2>Saves, states &amp; backups</h2>
         <div class="kv">
-          <div><b>Save states</b><p>5 slots per game + file exports (<code>.state</code>). Captures RAM exactly, including cheat effects. Import a compatible state from the Saves tab while its matching game is running.</p></div>
-          <div><b>Battery saves</b><p>The game's own save file (<code>.sav</code>). Auto-synced to your PC, restored on launch, portable to other emulators and hardware. Export it before you experiment.</p></div>
+          <div><b>Save states</b><p>5 slots per game + validated <code>.pgstate</code> exports. Imports verify the ROM, core version, size and checksum before loading; legacy raw <code>.state</code> files still work.</p></div>
+          <div><b>Battery saves</b><p>The game's own save file (<code>.sav</code>). Event-driven auto-sync keeps two rolling previous copies and restores the latest when you load the ROM again.</p></div>
           <div><b>Where it lives</b><p>All ROMs, saves and states stay in your browser's private storage on this PC (IndexedDB + localStorage). Clearing site data wipes them — export anything precious.</p></div>
+        </div>
+        <div class="divider"></div>
+        <p class="muted small">A full backup includes cached ROMs, battery saves, states, cheats, favorites and settings. Restore validates every binary checksum before replacing this site's PixelGBA data.</p>
+        <div class="mini-actions">
+          <button type="button" class="btn btn-primary btn-sm" id="btnExportBackup">Export full backup</button>
+          <button type="button" class="btn btn-ghost btn-sm" id="btnImportBackup">Restore backup…</button>
+          <input type="file" id="backupInput" accept=".json,.pgbackup,application/json" hidden />
         </div>
       </div>
 
@@ -341,6 +358,11 @@ B505DB41 6E39EA4E</pre><p class="tiny muted">8 + 4 hex digits (some CB codes are
   </section>
 </main>
 
+<div class="update-banner" id="updateBanner" hidden role="status">
+  <span>A new PixelGBA version is ready. Your local games and saves will be kept.</span>
+  <button type="button" class="btn btn-primary btn-sm" id="btnApplyUpdate">Update and reload</button>
+  <button type="button" class="env-close" id="updateClose" aria-label="Dismiss update notice">×</button>
+</div>
 <div class="env-banner" id="envBanner" hidden>
   <svg viewBox="0 0 24 24" class="ico"><path d="M12 3 2.5 20h19L12 3Z" stroke="currentColor" stroke-width="1.6" fill="none" stroke-linejoin="round"/><path d="M12 9.5v4.2" stroke="currentColor" stroke-width="1.6"/><circle cx="12" cy="16.8" r="1" fill="currentColor"/></svg>
   <div>
@@ -369,6 +391,7 @@ window.PIXELGBA_FLAT_PATHS = {
 };
 </script>
 <!-- Engine + data + app -->
+<script src="build-info.js"></script>
 <script src="cheats-db.js"></script>
 <script src="app.js"></script>
 </body>

@@ -23,7 +23,7 @@ const assets = {
   "version.json": 50, "en-US.json": 5000, "mgba.json": 50,
   "mgba-wasm.data": 1000000, "mgba-legacy-wasm.data": 1000000,
   "extract7z.js": 250000, "extractzip.js": 170000, "libunrar.js": 50000,
-  "libunrar.wasm": 150000, "sw.js": 500
+  "libunrar.wasm": 150000, "sw.js": 500, "build-info.js": 100
 };
 const fmt = n => n >= 1048576 ? (n/1048576).toFixed(2)+" MB" : n >= 1024 ? (n/1024).toFixed(1)+" KB" : n+" B";
 async function inspect(name, minimum) {

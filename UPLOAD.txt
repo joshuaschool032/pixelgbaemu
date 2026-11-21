@@ -22,7 +22,8 @@ REQUIRED RUNTIME FILES
   extractzip.js           archive worker
   libunrar.js             archive worker
   libunrar.wasm           archive worker WASM
-  sw.js                    offline cache
+  sw.js                    versioned offline cache
+  build-info.js            generated cache ID and asset manifest
   check.html               deployment self-check
   LICENSE                 project/EmulatorJS GPL-3.0 text
   THIRD_PARTY_NOTICES.md  component notices and source links
@@ -46,6 +47,7 @@ The local launchers bind only to the loopback interface.
 
 DEVELOPER VERIFICATION
   npm ci
+  npm run build:meta   (required after changing any cached runtime asset)
   npm run test:all
 
 See README.md for storage behavior, browser support, dependency updates,

@@ -15,7 +15,9 @@ const chromium = require("@sparticuz/chromium");
 chromium.setGraphicsMode = true;
 const executablePath = await chromium.executablePath();
 const command = resolve("node_modules", ".bin", process.platform === "win32" ? "playwright.cmd" : "playwright");
-const child = spawn(command, ["test", ...process.argv.slice(2)], {
+const requested = process.argv.slice(2);
+const projects = requested.some((arg) => arg.startsWith("--project")) ? [] : ["--project=chromium", "--project=mobile-chromium"];
+const child = spawn(command, ["test", ...projects, ...requested], {
   stdio: "inherit",
   env: {
     ...process.env,
