@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>PixelGBA — Game Boy Advance Emulator</title>
 <meta name="description" content="A Game Boy Advance emulator for your PC. Play .gba ROMs, save anytime, and use built-in Pokémon cheat codes. Runs fully offline." />
-<link rel="stylesheet" href="css/styles.css" />
+<link rel="stylesheet" href="styles.css" />
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect x='6' y='10' width='52' height='44' rx='10' fill='%237c6cff'/%3E%3Crect x='14' y='18' width='36' height='24' rx='4' fill='%230b1020'/%3E%3Ccircle cx='24' cy='47' r='3' fill='%23a3e635'/%3E%3Ccircle cx='40' cy='47' r='3' fill='%23f472b6'/%3E%3C/svg%3E" />
 </head>
 <body>
@@ -349,8 +349,26 @@ B505DB41 6E39EA4E</pre><p class="tiny muted">8 + 4 hex digits (some CB codes are
 </div>
 <div class="toasts" id="toasts" aria-live="polite"></div>
 
+<script>
+/* FLAT-BUILD path map: every engine file sits next to index.html, so tell EmulatorJS
+   where each relative path really lives. Used by app.js when it configures the engine. */
+window.PIXELGBA_FLAT_PATHS = {
+  "loader.js":               "loader.js",
+  "emulator.min.js":         "emulator.min.js",
+  "emulator.min.css":        "emulator.min.css",
+  "version.json":            "version.json",
+  "en-US.json":              "en-US.json",
+  "mgba.json":               "mgba.json",
+  "mgba-wasm.data":          "mgba-wasm.data",
+  "mgba-legacy-wasm.data":   "mgba-legacy-wasm.data",
+  "extract7z.js":            "extract7z.js",
+  "extractzip.js":           "extractzip.js",
+  "libunrar.js":             "libunrar.js",
+  "libunrar.wasm":           "libunrar.wasm"
+};
+</script>
 <!-- Engine + data + app -->
-<script src="js/cheats-db.js"></script>
-<script src="js/app.js"></script>
+<script src="cheats-db.js"></script>
+<script src="app.js"></script>
 </body>
 </html>
